@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-musl:
+    name: Linux musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev f8151ae777290430cf2108efacf3976d9528500b --locked
+      - name: Build release binary
+        run: cross build --locked --release --target "${{ matrix.target }}"
+      - name: Package release archive
+        shell: bash
+        run: |
+          archive="easy-music-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${archive}"
+          install -m 755 "target/${{ matrix.target }}/release/easy-music" "dist/${archive}/easy-music"
+          cp README.md LICENSE "dist/${archive}/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+          sha256sum "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: easy-music-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: linux-musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true

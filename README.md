@@ -36,6 +36,11 @@ cargo build --release
 cargo install --path .
 ```
 
+Tags matching `v*` publish musl-linked Linux archives for
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, each with a
+SHA-256 checksum. These binaries are portable across common glibc- and
+musl-based Linux systems; `ffmpeg` is still a separate runtime requirement.
+
 ## Agent-facing metadata commands
 
 ```bash
