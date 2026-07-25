@@ -134,9 +134,15 @@ struct StreamLease {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchMusicParams {
-    #[schemars(description = "Song title. Keep separate from artist.")]
+    #[schemars(
+        with = "String",
+        description = "Song title. Keep separate from artist."
+    )]
     title: Option<String>,
-    #[schemars(description = "Optional artist name used for ranking.")]
+    #[schemars(
+        with = "String",
+        description = "Optional artist name used for ranking."
+    )]
     artist: Option<String>,
 }
 
@@ -145,12 +151,13 @@ struct PrepareStreamParams {
     #[schemars(description = "Track ID returned by the search tool.")]
     id: String,
     #[schemars(
+        schema_with = "mcp_output_profile_schema",
         description = "Terminal output profile. Defaults to xiaozhi-v1. Supported values: xiaozhi-v1, web-opus, pcm-s16le-16k, pcm-s16le-24k."
     )]
     profile: Option<McpOutputProfile>,
-    #[schemars(description = "Optional starting offset in seconds.")]
+    #[schemars(with = "f64", description = "Optional starting offset in seconds.")]
     start_seconds: Option<f64>,
-    #[schemars(description = "Optional playback duration in seconds.")]
+    #[schemars(with = "f64", description = "Optional playback duration in seconds.")]
     duration_seconds: Option<f64>,
 }
 
@@ -166,6 +173,18 @@ enum McpOutputProfile {
     PcmS16le16k,
     #[serde(rename = "pcm-s16le-24k")]
     PcmS16le24k,
+}
+
+fn mcp_output_profile_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": [
+            "xiaozhi-v1",
+            "web-opus",
+            "pcm-s16le-16k",
+            "pcm-s16le-24k"
+        ]
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -602,6 +621,26 @@ mod tests {
 
         let parsed: McpOutputProfile = serde_json::from_str(r#""pcm-s16le-24k""#).unwrap();
         assert_eq!(parsed.config().name, "pcm-s16le-24k");
+    }
+
+    #[test]
+    fn mcp_parameter_schemas_inline_optional_value_types() {
+        let search = serde_json::to_value(schemars::schema_for!(SearchMusicParams)).unwrap();
+        assert_eq!(search["properties"]["title"]["type"], "string");
+        assert_eq!(search["properties"]["artist"]["type"], "string");
+
+        let prepare = serde_json::to_value(schemars::schema_for!(PrepareStreamParams)).unwrap();
+        let profile = &prepare["properties"]["profile"];
+        assert_eq!(profile["type"], "string");
+        assert_eq!(
+            profile["enum"],
+            json!(["xiaozhi-v1", "web-opus", "pcm-s16le-16k", "pcm-s16le-24k"])
+        );
+        assert_eq!(prepare["properties"]["start_seconds"]["type"], "number");
+        assert_eq!(prepare["properties"]["duration_seconds"]["type"], "number");
+        assert!(prepare.get("$defs").is_none());
+        assert!(profile.get("anyOf").is_none());
+        assert!(profile.get("$ref").is_none());
     }
 
     #[test]
