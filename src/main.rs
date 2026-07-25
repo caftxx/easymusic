@@ -1,8 +1,11 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
+use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use easy_music::api::DEFAULT_API_BASE_URL;
+use easy_music::mcp_server::{McpServerConfig, serve_mcp};
 use easy_music::model::PlaybackHint;
 use easy_music::{
     AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
@@ -47,6 +50,8 @@ enum Commands {
     Stream(StreamArgs),
     /// Download the original remote audio file without transcoding.
     Download(DownloadArgs),
+    /// Serve Agent tools over MCP stdio with loopback streaming URLs.
+    Mcp(McpArgs),
     /// Check ffmpeg and optionally the upstream API.
     Doctor(DoctorArgs),
 }
@@ -199,6 +204,20 @@ struct DownloadArgs {
 }
 
 #[derive(Debug, Args)]
+struct McpArgs {
+    /// Loopback address for one-time audio stream URLs.
+    #[arg(long, env = "EASY_MUSIC_STREAM_BIND", default_value = "127.0.0.1:0")]
+    stream_bind: SocketAddr,
+
+    /// Seconds before an unused one-time stream URL expires.
+    #[arg(long, default_value_t = 60)]
+    stream_ttl_seconds: u64,
+
+    #[arg(long, env = "EASY_MUSIC_FFMPEG", default_value = "ffmpeg")]
+    ffmpeg: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct DoctorArgs {
     /// Also issue a small search request against the configured API.
     #[arg(long)]
@@ -248,10 +267,10 @@ async fn main() -> ExitCode {
     let pretty = cli.pretty;
     match run(cli).await {
         Ok(output) => {
-            if let Some(value) = output {
-                if let Err(error) = print_json(&value, pretty) {
-                    return print_error(error);
-                }
+            if let Some(value) = output
+                && let Err(error) = print_json(&value, pretty)
+            {
+                return print_error(error);
             }
             ExitCode::SUCCESS
         }
@@ -324,6 +343,18 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
         Commands::Download(args) => {
             let result = run_download(&client, args).await?;
             Ok(Some(serde_json::to_value(result).expect("serializable")))
+        }
+        Commands::Mcp(args) => {
+            serve_mcp(
+                client,
+                McpServerConfig {
+                    stream_bind: args.stream_bind,
+                    stream_ttl: Duration::from_secs(args.stream_ttl_seconds),
+                    ffmpeg: args.ffmpeg,
+                },
+            )
+            .await?;
+            Ok(None)
         }
         Commands::Doctor(args) => {
             let ffmpeg = check_ffmpeg(&args.ffmpeg).await;

@@ -1,7 +1,7 @@
 # easy-music
 
 Agent-friendly music search, selection, downloading, and streaming audio
-transcoding CLI.
+transcoding CLI and MCP server.
 
 `easy-music` keeps metadata operations and binary streaming separate:
 
@@ -9,6 +9,7 @@ transcoding CLI.
   stdout.
 - `stream` writes only audio bytes to stdout; optional lifecycle JSONL goes to
   stderr.
+- `mcp` exposes search and one-time streaming preparation tools over MCP stdio.
 - The Rust library exposes the same API for in-process integrations.
 
 For a device integration, consume chunks directly instead of parsing CLI
@@ -25,7 +26,7 @@ audio.finish().await?;
 
 ## Requirements
 
-- Rust 1.85 or newer to build.
+- Rust 1.88 or newer to build.
 - `ffmpeg` on `PATH` for `stream`.
 
 ## Build
@@ -47,6 +48,25 @@ easy-music prepare --title "晴天" --artist "周杰伦" --target xiaozhi --pret
 Do not concatenate title and artist into one upstream keyword. Search by title,
 then use `--artist` for local ranking. This handles providers that return no
 results for combined queries such as `晴天 周杰伦`.
+
+## MCP server
+
+Start the local stdio MCP server:
+
+```bash
+easy-music mcp
+```
+
+It exposes:
+
+- `search_music`: search, rank, and return a selected track plus alternatives.
+- `prepare_stream`: resolve a selected ID and return a short-lived, one-time
+  loopback URL for a 24 kHz mono `len32be` Opus stream.
+
+MCP is the control plane only. Prepared audio is served over an ephemeral HTTP
+listener bound to `127.0.0.1`; the URL expires after 60 seconds and can be
+consumed once. Override the ffmpeg executable with `EASY_MUSIC_FFMPEG`, the
+listener with `EASY_MUSIC_STREAM_BIND`, or use the corresponding `mcp` flags.
 
 ## Downloading
 
