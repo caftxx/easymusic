@@ -1,9 +1,7 @@
-use std::net::{IpAddr, Ipv6Addr};
 use std::process::Stdio;
 
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::lookup_host;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -11,6 +9,7 @@ use tokio::task::JoinHandle;
 use crate::api::validate_http_url;
 use crate::error::{EasyMusicError, ErrorCode, Result};
 use crate::model::{AudioChunk, AudioChunkKind, AudioFormat, StreamConfig, StreamStats};
+use crate::network::reject_private_host;
 
 const MAX_OGG_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const AUDIO_CHANNEL_CAPACITY: usize = 8;
@@ -283,67 +282,6 @@ fn format_frame_duration(value: f32) -> String {
     }
 }
 
-async fn reject_private_host(url: &url::Url) -> Result<()> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| EasyMusicError::source("audio URL has no host"))?;
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return Err(EasyMusicError::source(
-            "private or loopback audio URLs require --allow-private-network",
-        ));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) {
-            return Err(EasyMusicError::source(
-                "private or loopback audio URLs require --allow-private-network",
-            ));
-        }
-        return Ok(());
-    }
-
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addresses = lookup_host((host, port))
-        .await
-        .map_err(|error| EasyMusicError::source(format!("cannot resolve audio host: {error}")))?;
-    for address in addresses {
-        if is_private_ip(address.ip()) {
-            return Err(EasyMusicError::source(
-                "audio host resolves to a private or loopback address; use --allow-private-network to override",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.octets()[0] == 0
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || is_ipv6_documentation(ip)
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| is_private_ip(IpAddr::V4(mapped)))
-        }
-    }
-}
-
-fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
-}
-
 async fn read_byte_chunks<R>(
     reader: &mut R,
     sender: &mpsc::Sender<AudioChunk>,
@@ -444,7 +382,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     fn ogg_page(packets: &[&[u8]]) -> Vec<u8> {
         let lacing: Vec<u8> = packets
@@ -481,12 +418,5 @@ mod tests {
 
         assert_eq!(stats.packets_written, 2);
         assert_eq!(packets, vec![b"first".to_vec(), b"second".to_vec()]);
-    }
-
-    #[test]
-    fn rejects_private_addresses() {
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 }

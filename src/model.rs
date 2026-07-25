@@ -120,6 +120,23 @@ pub struct StreamStats {
     pub packets_written: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadConfig {
+    pub url: String,
+    pub output: PathBuf,
+    pub overwrite: bool,
+    pub allow_private_network: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedFile {
+    pub path: PathBuf,
+    pub source_url: String,
+    pub bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpstreamSearchResponse {
     pub success: bool,

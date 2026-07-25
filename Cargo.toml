@@ -3,8 +3,9 @@ name = "easy-music"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Agent-friendly music search, selection, resolution, and streaming transcoding CLI"
+description = "Agent-friendly music search, download, and streaming transcoding CLI"
 license = "MIT"
+repository = "https://github.com/caftxx/easy-music"
 keywords = ["music", "audio", "streaming", "agent", "cli"]
 categories = ["command-line-utilities", "multimedia::audio"]
 

@@ -1,11 +1,12 @@
 # easy-music
 
-Agent-friendly music search, selection, resolution, and streaming audio
+Agent-friendly music search, selection, downloading, and streaming audio
 transcoding CLI.
 
 `easy-music` keeps metadata operations and binary streaming separate:
 
-- `search`, `select`, `resolve`, and `prepare` write stable JSON to stdout.
+- `search`, `select`, `resolve`, `prepare`, and `download` write stable JSON to
+  stdout.
 - `stream` writes only audio bytes to stdout; optional lifecycle JSONL goes to
   stderr.
 - The Rust library exposes the same API for in-process integrations.
@@ -46,6 +47,26 @@ easy-music prepare --title "晴天" --artist "周杰伦" --target xiaozhi --pret
 Do not concatenate title and artist into one upstream keyword. Search by title,
 then use `--artist` for local ranking. This handles providers that return no
 results for combined queries such as `晴天 周杰伦`.
+
+## Downloading
+
+Download the original remote audio bytes without invoking ffmpeg:
+
+```bash
+# Automatically named "周杰伦 - 晴天.mp3" in the current directory
+easy-music download --title "晴天" --artist "周杰伦" --pretty
+
+# Download by search-result ID to an exact path
+easy-music download --id "MTEyNjE3ODA=" --output "./music/sunny.mp3" --pretty
+
+# Download an already resolved URL into a directory
+easy-music download --url "https://example.com/song.mp3" --output-dir "./music"
+```
+
+Downloads are streamed through a temporary sibling file and moved into place
+only after completion. Existing files are preserved unless `--force` is
+specified. The JSON result includes the final absolute path, byte count,
+content type, selected track, and selection confidence when available.
 
 ## Streaming
 

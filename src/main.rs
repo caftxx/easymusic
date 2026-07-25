@@ -5,8 +5,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use easy_music::api::DEFAULT_API_BASE_URL;
 use easy_music::model::PlaybackHint;
 use easy_music::{
-    AudioFormat, AudioProfile, EasyMusicError, ErrorCode, Framing, MusicClient, PreparedTrack,
-    Result, StreamConfig, rank_tracks, select_track, stream_audio,
+    AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
+    MusicClient, PreparedTrack, Result, StreamConfig, Track, download_audio, rank_tracks,
+    select_track, stream_audio,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -44,6 +45,8 @@ enum Commands {
     Prepare(PrepareArgs),
     /// Stream a remote track through ffmpeg as PCM or Opus.
     Stream(StreamArgs),
+    /// Download the original remote audio file without transcoding.
+    Download(DownloadArgs),
     /// Check ffmpeg and optionally the upstream API.
     Doctor(DoctorArgs),
 }
@@ -161,6 +164,41 @@ struct StreamArgs {
 }
 
 #[derive(Debug, Args)]
+struct DownloadArgs {
+    /// Resolve this track ID before downloading.
+    #[arg(long)]
+    id: Option<String>,
+
+    /// Select a track by song title before downloading.
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Artist hint used with --title, or as the search keyword by itself.
+    #[arg(long)]
+    artist: Option<String>,
+
+    /// Download an already resolved HTTP(S) URL.
+    #[arg(long)]
+    url: Option<String>,
+
+    /// Exact destination file path.
+    #[arg(long, conflicts_with = "output_dir")]
+    output: Option<PathBuf>,
+
+    /// Directory for an automatically named file. Defaults to the current directory.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Replace an existing destination file.
+    #[arg(long)]
+    force: bool,
+
+    /// Permit localhost, private, and link-local source URLs.
+    #[arg(long)]
+    allow_private_network: bool,
+}
+
+#[derive(Debug, Args)]
 struct DoctorArgs {
     /// Also issue a small search request against the configured API.
     #[arg(long)]
@@ -190,6 +228,18 @@ struct ApiStatus {
     ok: bool,
     base_url: String,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DownloadCommandResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track: Option<Track>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needs_confirmation: Option<bool>,
+    file: DownloadedFile,
 }
 
 #[tokio::main]
@@ -271,6 +321,10 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
             stream_audio(&config).await?;
             Ok(None)
         }
+        Commands::Download(args) => {
+            let result = run_download(&client, args).await?;
+            Ok(Some(serde_json::to_value(result).expect("serializable")))
+        }
         Commands::Doctor(args) => {
             let ffmpeg = check_ffmpeg(&args.ffmpeg).await;
             let api = if args.online {
@@ -297,6 +351,62 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
     }
 }
 
+async fn run_download(client: &MusicClient, args: DownloadArgs) -> Result<DownloadCommandResult> {
+    let has_query = args.title.is_some() || args.artist.is_some();
+    let source_count =
+        usize::from(args.id.is_some()) + usize::from(args.url.is_some()) + usize::from(has_query);
+    if source_count != 1 {
+        return Err(EasyMusicError::invalid(
+            "provide exactly one source: --id, --url, or --title/--artist",
+        ));
+    }
+
+    let (url, track, confidence, needs_confirmation) = if let Some(id) = &args.id {
+        let resolved = client.resolve(id).await?;
+        (
+            resolved.url,
+            Some(Track {
+                id: resolved.id,
+                title: resolved.title,
+                artist: String::new(),
+                artwork_url: None,
+            }),
+            None,
+            None,
+        )
+    } else if let Some(url) = &args.url {
+        (url.clone(), None, None, None)
+    } else {
+        let selection =
+            select_from_query(client, args.title.as_deref(), args.artist.as_deref()).await?;
+        let track = selection.selected.track;
+        let resolved = client.resolve(&track.id).await?;
+        (
+            resolved.url,
+            Some(track),
+            Some(selection.confidence),
+            Some(selection.needs_confirmation),
+        )
+    };
+
+    let output = download_output_path(args.output, args.output_dir, track.as_ref(), &url)?;
+    let file = download_audio(&DownloadConfig {
+        url,
+        output,
+        overwrite: args.force,
+        allow_private_network: args.allow_private_network,
+    })
+    .await?;
+
+    Ok(DownloadCommandResult {
+        ok: true,
+        track,
+        confidence,
+        needs_confirmation,
+        file,
+    })
+}
+
 async fn select_from_query(
     client: &MusicClient,
     title: Option<&str>,
@@ -307,6 +417,113 @@ async fn select_from_query(
     })?;
     let search = client.search(keyword).await?;
     select_track(&search.tracks, title, artist)
+}
+
+fn download_output_path(
+    output: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    track: Option<&Track>,
+    url: &str,
+) -> Result<PathBuf> {
+    if let Some(output) = output {
+        return Ok(output);
+    }
+
+    let file_name = if let Some(track) = track {
+        let stem = if track.artist.trim().is_empty() {
+            track.title.clone()
+        } else {
+            format!("{} - {}", track.artist, track.title)
+        };
+        format!(
+            "{}.{}",
+            sanitize_filename_component(&stem),
+            extension_from_url(url)
+        )
+    } else {
+        file_name_from_url(url)
+    };
+    Ok(output_dir
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(file_name))
+}
+
+fn file_name_from_url(value: &str) -> String {
+    let parsed = url::Url::parse(value).ok();
+    let segment = parsed
+        .as_ref()
+        .and_then(|url| url.path_segments())
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty());
+    match segment {
+        Some(segment) => {
+            let sanitized = sanitize_filename_component(segment);
+            if sanitized.contains('.') {
+                sanitized
+            } else {
+                format!("{sanitized}.{}", extension_from_url(value))
+            }
+        }
+        None => format!("download.{}", extension_from_url(value)),
+    }
+}
+
+fn extension_from_url(value: &str) -> String {
+    let extension = url::Url::parse(value)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .and_then(|segment| {
+                    segment
+                        .rsplit_once('.')
+                        .map(|(_, extension)| extension.to_owned())
+                })
+        })
+        .filter(|extension| {
+            (1..=10).contains(&extension.len())
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        });
+    extension
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "audio".to_owned())
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let mut sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || r#"<>:"/\|?*"#.contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(120)
+        .collect();
+    sanitized = sanitized.trim().trim_end_matches(['.', ' ']).to_owned();
+    if sanitized.is_empty() {
+        return "download".to_owned();
+    }
+
+    let base = sanitized
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || base
+            .strip_prefix("COM")
+            .or_else(|| base.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                number.len() == 1 && number.as_bytes()[0].is_ascii_digit() && number != "0"
+            });
+    if reserved {
+        sanitized.insert(0, '_');
+    }
+    sanitized
 }
 
 fn stream_config(url: String, args: StreamArgs) -> StreamConfig {
@@ -395,4 +612,34 @@ fn print_error(error: EasyMusicError) -> ExitCode {
         })
     );
     error.code.as_exit_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_safe_track_file_names() {
+        let track = Track {
+            id: "id".to_owned(),
+            title: "晴天: Live?".to_owned(),
+            artist: "周杰伦".to_owned(),
+            artwork_url: None,
+        };
+        let path = download_output_path(
+            None,
+            Some(PathBuf::from("music")),
+            Some(&track),
+            "https://example.com/song.MP3?token=temporary",
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("music/周杰伦 - 晴天_ Live_.mp3"));
+    }
+
+    #[test]
+    fn protects_windows_reserved_file_names() {
+        assert_eq!(sanitize_filename_component("CON"), "_CON");
+        assert_eq!(sanitize_filename_component("LPT1.txt"), "_LPT1.txt");
+        assert_eq!(sanitize_filename_component("..."), "download");
+    }
 }
