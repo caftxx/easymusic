@@ -14,6 +14,8 @@ use crate::network::reject_private_host;
 const MAX_OGG_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const AUDIO_CHANNEL_CAPACITY: usize = 8;
 const BYTE_CHUNK_SIZE: usize = 16 * 1024;
+const NETWORK_RW_TIMEOUT_MICROS: &str = "15000000";
+const HTTP_RECONNECT_DELAY_MAX_SECONDS: &str = "2";
 
 pub struct AudioStream {
     receiver: mpsc::Receiver<AudioChunk>,
@@ -218,6 +220,14 @@ fn build_ffmpeg_command(config: &StreamConfig) -> Command {
     command.args([
         "-protocol_whitelist",
         "http,https,tcp,tls,crypto",
+        "-rw_timeout",
+        NETWORK_RW_TIMEOUT_MICROS,
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        HTTP_RECONNECT_DELAY_MAX_SECONDS,
         "-user_agent",
         concat!("easy-music/", env!("CARGO_PKG_VERSION")),
         "-i",
@@ -404,6 +414,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn stream_config() -> StreamConfig {
+        StreamConfig {
+            url: "https://example.com/song.mp3".to_owned(),
+            format: AudioFormat::OpusPackets,
+            sample_rate: 24_000,
+            channels: 1,
+            bitrate: 64_000,
+            frame_ms: 60.0,
+            framing: crate::model::Framing::Len32be,
+            output: None,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            allow_private_network: false,
+            start_seconds: None,
+            duration_seconds: None,
+            events_json: false,
+        }
+    }
 
     fn ogg_page(packets: &[&[u8]]) -> Vec<u8> {
         let lacing: Vec<u8> = packets
@@ -440,5 +469,29 @@ mod tests {
 
         assert_eq!(stats.packets_written, 2);
         assert_eq!(packets, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[test]
+    fn ffmpeg_http_input_has_reconnect_and_io_timeout_options() {
+        let command = build_ffmpeg_command(&stream_config());
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let input_index = args.iter().position(|arg| arg == "-i").unwrap();
+        let input_args = &args[..input_index];
+        let option_value = |name: &str| {
+            let index = input_args.iter().position(|arg| arg == name).unwrap();
+            input_args[index + 1].as_str()
+        };
+
+        assert_eq!(option_value("-rw_timeout"), NETWORK_RW_TIMEOUT_MICROS);
+        assert_eq!(option_value("-reconnect"), "1");
+        assert_eq!(option_value("-reconnect_streamed"), "1");
+        assert_eq!(
+            option_value("-reconnect_delay_max"),
+            HTTP_RECONNECT_DELAY_MAX_SECONDS
+        );
     }
 }

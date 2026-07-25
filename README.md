@@ -91,6 +91,10 @@ evicted streams terminate their ffmpeg process. Override the ffmpeg executable
 with `EASY_MUSIC_FFMPEG`, the listener with `EASY_MUSIC_STREAM_BIND`, or use the
 corresponding `mcp` flags.
 
+Remote HTTP audio reads have a 15-second I/O timeout. ffmpeg automatically
+reconnects interrupted seekable and streaming responses with a maximum
+two-second reconnect delay, while normal end-of-file still completes playback.
+
 ## Downloading
 
 Download the original remote audio bytes without invoking ffmpeg:
