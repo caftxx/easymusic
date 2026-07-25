@@ -1,6 +1,6 @@
 //! MCP control plane and loopback HTTP data plane for Agent integrations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,11 +23,13 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::error::{EasyMusicError, ErrorCode};
-use crate::model::{AudioChunkKind, AudioFormat, Framing, StreamConfig};
-use crate::{MusicClient, select_track, spawn_audio_stream};
+use crate::model::{AudioChunk, AudioChunkKind, AudioFormat, Framing, StreamConfig};
+use crate::{AudioStream, MusicClient, select_track, spawn_audio_stream};
 
 const STREAM_CONTENT_TYPE: &str = "application/x-opus-packets";
 const STREAM_PATH_PREFIX: &str = "/streams/";
+const PREBUFFER_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PENDING_STREAMS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
@@ -44,7 +46,8 @@ struct StreamBroker {
 }
 
 struct PendingStream {
-    config: StreamConfig,
+    audio: AudioStream,
+    buffered: VecDeque<AudioChunk>,
     content_type: &'static str,
     expires_at: Instant,
 }
@@ -63,10 +66,23 @@ impl StreamBroker {
         }
     }
 
-    async fn insert(&self, config: StreamConfig, content_type: &'static str) -> StreamLease {
+    async fn insert(
+        &self,
+        audio: AudioStream,
+        buffered: VecDeque<AudioChunk>,
+        content_type: &'static str,
+    ) -> StreamLease {
         let now = Instant::now();
         let mut entries = self.entries.lock().await;
         entries.retain(|_, pending| pending.expires_at > now);
+        if entries.len() >= MAX_PENDING_STREAMS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, pending)| pending.expires_at)
+                .map(|(token, _)| token.clone())
+        {
+            entries.remove(&oldest);
+        }
 
         let token: String = rand::rng()
             .sample_iter(&Alphanumeric)
@@ -76,15 +92,32 @@ impl StreamBroker {
         entries.insert(
             token.clone(),
             PendingStream {
-                config,
+                audio,
+                buffered,
                 content_type,
                 expires_at: now + self.ttl,
             },
         );
-        StreamLease {
+        let lease = StreamLease {
             url: format!("{}{STREAM_PATH_PREFIX}{token}", self.base_url),
             expires_in_seconds: self.ttl.as_secs(),
-        }
+        };
+        drop(entries);
+
+        let cleanup_entries = self.entries.clone();
+        let cleanup_token = token;
+        let ttl = self.ttl;
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let mut entries = cleanup_entries.lock().await;
+            if entries
+                .get(&cleanup_token)
+                .is_some_and(|pending| pending.expires_at <= Instant::now())
+            {
+                entries.remove(&cleanup_token);
+            }
+        });
+        lease
     }
 
     async fn take(&self, token: &str) -> Option<PendingStream> {
@@ -212,6 +245,9 @@ struct PreparedStream {
     sample_rate: u32,
     channels: u8,
     frame_duration_ms: u32,
+    ready: bool,
+    prebuffered_bytes: usize,
+    prepare_latency_ms: u64,
     expires_in_seconds: u64,
 }
 
@@ -232,7 +268,7 @@ impl EasyMusicMcp {
     }
 
     #[tool(
-        description = "Call only after the selected track is confirmed, or search_music returned needs_confirmation=false. Prepare a terminal-neutral, one-time audio stream using the requested output profile, mapping offsets to start_seconds and playback limits to duration_seconds. Pass stream_url and its returned format metadata immediately to a compatible playback tool; the URL is single-use and expires quickly."
+        description = "Call only after the selected track is confirmed, or search_music returned needs_confirmation=false. Start ffmpeg and wait until the first chunk is buffered, then return a terminal-neutral, one-time audio stream using the requested output profile, mapping offsets to start_seconds and playback limits to duration_seconds. Pass stream_url and its returned format metadata immediately to a compatible playback tool; the URL is single-use and expires quickly."
     )]
     async fn prepare_stream(&self, Parameters(params): Parameters<PrepareStreamParams>) -> String {
         tool_json(self.prepare_stream_inner(params).await)
@@ -258,6 +294,7 @@ impl EasyMusicMcp {
         &self,
         params: PrepareStreamParams,
     ) -> crate::Result<PreparedStream> {
+        let prepare_started = Instant::now();
         let id = params.id.trim();
         if id.is_empty() {
             return Err(EasyMusicError::invalid("track id is required"));
@@ -288,7 +325,13 @@ impl EasyMusicMcp {
             duration_seconds: params.duration_seconds,
             events_json: false,
         };
-        let lease = self.broker.insert(config, profile.content_type).await;
+        let audio = spawn_audio_stream(&config).await?;
+        let warmed = prebuffer_first_chunk(audio, PREBUFFER_TIMEOUT).await?;
+        let prebuffered_bytes = warmed.buffered.iter().map(|chunk| chunk.data.len()).sum();
+        let lease = self
+            .broker
+            .insert(warmed.audio, warmed.buffered, profile.content_type)
+            .await;
         Ok(PreparedStream {
             ok: true,
             stream_url: lease.url,
@@ -301,6 +344,9 @@ impl EasyMusicMcp {
             sample_rate: profile.sample_rate,
             channels: profile.channels,
             frame_duration_ms: profile.frame_ms as u32,
+            ready: true,
+            prebuffered_bytes,
+            prepare_latency_ms: prepare_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             expires_in_seconds: lease.expires_in_seconds,
         })
     }
@@ -361,7 +407,7 @@ pub async fn serve_mcp(client: MusicClient, config: McpServerConfig) -> crate::R
 }
 
 async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<String>) -> Response {
-    let Some(pending) = broker.take(&token).await else {
+    let Some(mut pending) = broker.take(&token).await else {
         return (
             StatusCode::GONE,
             "music stream is unknown, expired, or already consumed",
@@ -369,34 +415,15 @@ async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<St
             .into_response();
     };
     let content_type = pending.content_type;
-    let mut audio = match spawn_audio_stream(&pending.config).await {
-        Ok(audio) => audio,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("failed to start audio stream: {}", error.message),
-            )
-                .into_response();
-        }
-    };
 
     let stream = async_stream::stream! {
-        while let Some(chunk) = audio.next_chunk().await {
-            let bytes = if chunk.kind == AudioChunkKind::OpusPacket {
-                let Ok(length) = u32::try_from(chunk.data.len()) else {
-                    eprintln!("easy-music stream packet exceeded u32 length");
-                    break;
-                };
-                let mut framed = Vec::with_capacity(4 + chunk.data.len());
-                framed.extend_from_slice(&length.to_be_bytes());
-                framed.extend_from_slice(&chunk.data);
-                framed
-            } else {
-                chunk.data
-            };
-            yield Ok::<Bytes, io::Error>(Bytes::from(bytes));
+        while let Some(chunk) = pending.buffered.pop_front() {
+            yield frame_stream_chunk(chunk);
         }
-        if let Err(error) = audio.finish().await {
+        while let Some(chunk) = pending.audio.next_chunk().await {
+            yield frame_stream_chunk(chunk);
+        }
+        if let Err(error) = pending.audio.finish().await {
             eprintln!("easy-music stream failed: {}", error.message);
             yield Err(io::Error::other(error.message));
         }
@@ -408,6 +435,42 @@ async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<St
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+struct WarmedAudio {
+    audio: AudioStream,
+    buffered: VecDeque<AudioChunk>,
+}
+
+async fn prebuffer_first_chunk(
+    mut audio: AudioStream,
+    timeout: Duration,
+) -> crate::Result<WarmedAudio> {
+    let chunk = tokio::time::timeout(timeout, audio.next_chunk())
+        .await
+        .map_err(|_| EasyMusicError::transcode("timed out waiting for the first audio chunk"))?;
+    let Some(chunk) = chunk else {
+        audio.finish().await?;
+        return Err(EasyMusicError::transcode(
+            "ffmpeg completed without producing audio",
+        ));
+    };
+    Ok(WarmedAudio {
+        audio,
+        buffered: VecDeque::from([chunk]),
+    })
+}
+
+fn frame_stream_chunk(chunk: AudioChunk) -> Result<Bytes, io::Error> {
+    if chunk.kind != AudioChunkKind::OpusPacket {
+        return Ok(Bytes::from(chunk.data));
+    }
+    let length = u32::try_from(chunk.data.len())
+        .map_err(|_| io::Error::other("easy-music Opus packet exceeded u32 length"))?;
+    let mut framed = Vec::with_capacity(4 + chunk.data.len());
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(&chunk.data);
+    Ok(Bytes::from(framed))
 }
 
 fn trimmed(value: Option<String>) -> Option<String> {
@@ -434,31 +497,89 @@ fn tool_json<T: Serialize>(result: crate::Result<T>) -> String {
 mod tests {
     use super::*;
 
-    fn config() -> StreamConfig {
-        StreamConfig {
-            url: "https://example.com/song.mp3".to_owned(),
-            format: AudioFormat::OpusPackets,
-            sample_rate: 24_000,
-            channels: 1,
-            bitrate: 64_000,
-            frame_ms: 60.0,
-            framing: Framing::Len32be,
-            output: None,
-            ffmpeg: PathBuf::from("ffmpeg"),
-            allow_private_network: false,
-            start_seconds: None,
-            duration_seconds: None,
-            events_json: false,
-        }
-    }
-
     #[tokio::test]
     async fn stream_leases_are_one_time() {
         let broker = StreamBroker::new("127.0.0.1:1234".parse().unwrap(), Duration::from_secs(30));
-        let lease = broker.insert(config(), STREAM_CONTENT_TYPE).await;
+        let audio = AudioStream::from_test_chunks(vec![AudioChunk {
+            kind: AudioChunkKind::OpusPacket,
+            data: b"ready".to_vec(),
+        }]);
+        let warmed = prebuffer_first_chunk(audio, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let lease = broker
+            .insert(warmed.audio, warmed.buffered, STREAM_CONTENT_TYPE)
+            .await;
         let token = lease.url.rsplit('/').next().unwrap();
         assert!(broker.take(token).await.is_some());
         assert!(broker.take(token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_warmed_streams_are_removed_without_another_insert() {
+        let broker =
+            StreamBroker::new("127.0.0.1:1234".parse().unwrap(), Duration::from_millis(10));
+        let audio = AudioStream::from_test_chunks(vec![AudioChunk {
+            kind: AudioChunkKind::Bytes,
+            data: b"ready".to_vec(),
+        }]);
+        let warmed = prebuffer_first_chunk(audio, Duration::from_secs(1))
+            .await
+            .unwrap();
+        broker
+            .insert(warmed.audio, warmed.buffered, "audio/ogg")
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(broker.entries.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_streams_are_bounded_and_evict_the_oldest() {
+        let broker = StreamBroker::new("127.0.0.1:1234".parse().unwrap(), Duration::from_secs(30));
+        let mut first_token = String::new();
+
+        for index in 0..=MAX_PENDING_STREAMS {
+            let audio = AudioStream::from_test_chunks(vec![AudioChunk {
+                kind: AudioChunkKind::Bytes,
+                data: vec![index as u8],
+            }]);
+            let warmed = prebuffer_first_chunk(audio, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let lease = broker
+                .insert(warmed.audio, warmed.buffered, "audio/pcm")
+                .await;
+            if index == 0 {
+                first_token = lease.url.rsplit('/').next().unwrap().to_owned();
+            }
+        }
+
+        assert_eq!(broker.entries.lock().await.len(), MAX_PENDING_STREAMS);
+        assert!(broker.take(&first_token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn prebuffer_rejects_streams_without_audio() {
+        let error = prebuffer_first_chunk(
+            AudioStream::from_test_chunks(Vec::new()),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(error.code, ErrorCode::Transcode));
+        assert!(error.message.contains("without producing audio"));
+    }
+
+    #[test]
+    fn opus_chunks_are_length_prefixed_after_prebuffering() {
+        let framed = frame_stream_chunk(AudioChunk {
+            kind: AudioChunkKind::OpusPacket,
+            data: b"opus".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(framed.as_ref(), b"\0\0\0\x04opus");
     }
 
     #[test]

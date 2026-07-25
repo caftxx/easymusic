@@ -39,6 +39,28 @@ impl AudioStream {
             EasyMusicError::transcode(format!("audio stream task failed: {error}"))
         })?
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_chunks(chunks: Vec<AudioChunk>) -> Self {
+        let (sender, receiver) = mpsc::channel(chunks.len().max(1));
+        let task = tokio::spawn(async move {
+            let mut stats = StreamStats::default();
+            for chunk in chunks {
+                stats.bytes_written += chunk.data.len() as u64;
+                if chunk.kind == AudioChunkKind::OpusPacket {
+                    stats.packets_written += 1;
+                }
+                sender.send(chunk).await.map_err(|_| {
+                    EasyMusicError::new(ErrorCode::Interrupted, "test consumer closed")
+                })?;
+            }
+            Ok(stats)
+        });
+        Self {
+            receiver,
+            task: Some(task),
+        }
+    }
 }
 
 impl Drop for AudioStream {

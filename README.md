@@ -74,11 +74,17 @@ supports these profiles:
 For example, pass `"profile": "web-opus"` for browser-oriented playback.
 The result reports `profile`, `content_type`, `codec`, `framing`, sample rate,
 channel count, and nominal frame duration so clients can validate compatibility.
+It also reports `ready`, `prebuffered_bytes`, and `prepare_latency_ms`.
+`ready: true` means ffmpeg has already started and at least one audio chunk is
+buffered, reducing the delay between the terminal's HTTP request and its first
+audio frame.
 
 MCP is the control plane only. Prepared audio is served over an ephemeral HTTP
 listener bound to `127.0.0.1`; the URL expires after 60 seconds and can be
-consumed once. Override the ffmpeg executable with `EASY_MUSIC_FFMPEG`, the
-listener with `EASY_MUSIC_STREAM_BIND`, or use the corresponding `mcp` flags.
+consumed once. Up to eight unconsumed prepared streams are retained; expired or
+evicted streams terminate their ffmpeg process. Override the ffmpeg executable
+with `EASY_MUSIC_FFMPEG`, the listener with `EASY_MUSIC_STREAM_BIND`, or use the
+corresponding `mcp` flags.
 
 ## Downloading
 
