@@ -32,12 +32,13 @@ jobs:
       - name: Package release archive
         shell: bash
         run: |
-          archive="easy-music-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          version="${GITHUB_REF_NAME//\//-}"
+          archive="easy-music-${version}-${{ matrix.target }}"
           mkdir -p "dist/${archive}"
           install -m 755 "target/${{ matrix.target }}/release/easy-music" "dist/${archive}/easy-music"
           cp README.md LICENSE "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
-          sha256sum "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
+          (cd dist && sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
         with:
           name: easy-music-${{ matrix.target }}
@@ -46,10 +47,75 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  native:
+    name: ${{ matrix.platform }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: macOS
+            os: macos-15
+            target: aarch64-apple-darwin
+          - platform: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: Windows
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package macOS release archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME//\//-}"
+          archive="easy-music-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${archive}"
+          install -m 755 "target/${{ matrix.target }}/release/easy-music" "dist/${archive}/easy-music"
+          cp README.md LICENSE "dist/${archive}/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+          (cd dist && shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '[/\\]', '-'
+          $archive = "easy-music-$version-${{ matrix.target }}"
+          $packageDir = Join-Path "dist" $archive
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/easy-music.exe" $packageDir
+          Copy-Item README.md, LICENSE $packageDir
+          $archivePath = "$packageDir.zip"
+          Compress-Archive -Path $packageDir -DestinationPath $archivePath
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          "$hash  $archive.zip" | Out-File "$archivePath.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: easy-music-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
   github-release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: linux-musl
+    needs:
+      - linux-musl
+      - native
     runs-on: ubuntu-latest
     permissions:
       contents: write
