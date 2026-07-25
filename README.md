@@ -61,7 +61,19 @@ It exposes:
 
 - `search_music`: search, rank, and return a selected track plus alternatives.
 - `prepare_stream`: resolve a selected ID and return a short-lived, one-time
-  loopback URL for a 24 kHz mono `len32be` Opus stream.
+  loopback URL using a terminal output profile.
+
+`prepare_stream` defaults to `xiaozhi-v1` for backward compatibility and
+supports these profiles:
+
+- `xiaozhi-v1`: 24 kHz mono Opus packets, 60 ms, `len32be`.
+- `web-opus`: 48 kHz stereo Opus in an Ogg stream.
+- `pcm-s16le-16k`: raw 16 kHz mono signed 16-bit PCM.
+- `pcm-s16le-24k`: raw 24 kHz mono signed 16-bit PCM.
+
+For example, pass `"profile": "web-opus"` for browser-oriented playback.
+The result reports `profile`, `content_type`, `codec`, `framing`, sample rate,
+channel count, and nominal frame duration so clients can validate compatibility.
 
 MCP is the control plane only. Prepared audio is served over an ephemeral HTTP
 listener bound to `127.0.0.1`; the URL expires after 60 seconds and can be

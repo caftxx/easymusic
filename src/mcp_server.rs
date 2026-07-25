@@ -45,6 +45,7 @@ struct StreamBroker {
 
 struct PendingStream {
     config: StreamConfig,
+    content_type: &'static str,
     expires_at: Instant,
 }
 
@@ -62,7 +63,7 @@ impl StreamBroker {
         }
     }
 
-    async fn insert(&self, config: StreamConfig) -> StreamLease {
+    async fn insert(&self, config: StreamConfig, content_type: &'static str) -> StreamLease {
         let now = Instant::now();
         let mut entries = self.entries.lock().await;
         entries.retain(|_, pending| pending.expires_at > now);
@@ -76,6 +77,7 @@ impl StreamBroker {
             token.clone(),
             PendingStream {
                 config,
+                content_type,
                 expires_at: now + self.ttl,
             },
         );
@@ -109,10 +111,92 @@ struct SearchMusicParams {
 struct PrepareStreamParams {
     #[schemars(description = "Track ID returned by the search tool.")]
     id: String,
+    #[schemars(
+        description = "Terminal output profile. Defaults to xiaozhi-v1. Supported values: xiaozhi-v1, web-opus, pcm-s16le-16k, pcm-s16le-24k."
+    )]
+    profile: Option<McpOutputProfile>,
     #[schemars(description = "Optional starting offset in seconds.")]
     start_seconds: Option<f64>,
     #[schemars(description = "Optional playback duration in seconds.")]
     duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum McpOutputProfile {
+    #[default]
+    #[serde(rename = "xiaozhi-v1")]
+    XiaozhiV1,
+    #[serde(rename = "web-opus")]
+    WebOpus,
+    #[serde(rename = "pcm-s16le-16k")]
+    PcmS16le16k,
+    #[serde(rename = "pcm-s16le-24k")]
+    PcmS16le24k,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputProfile {
+    name: &'static str,
+    format: AudioFormat,
+    sample_rate: u32,
+    channels: u8,
+    bitrate: u32,
+    frame_ms: f32,
+    content_type: &'static str,
+    codec: &'static str,
+    framing: &'static str,
+}
+
+impl McpOutputProfile {
+    fn config(self) -> OutputProfile {
+        match self {
+            Self::XiaozhiV1 => OutputProfile {
+                name: "xiaozhi-v1",
+                format: AudioFormat::OpusPackets,
+                sample_rate: 24_000,
+                channels: 1,
+                bitrate: 64_000,
+                frame_ms: 60.0,
+                content_type: STREAM_CONTENT_TYPE,
+                codec: "opus",
+                framing: "len32be",
+            },
+            Self::WebOpus => OutputProfile {
+                name: "web-opus",
+                format: AudioFormat::OpusOgg,
+                sample_rate: 48_000,
+                channels: 2,
+                bitrate: 96_000,
+                frame_ms: 20.0,
+                content_type: "audio/ogg",
+                codec: "opus",
+                framing: "ogg",
+            },
+            Self::PcmS16le16k => OutputProfile {
+                name: "pcm-s16le-16k",
+                format: AudioFormat::PcmS16le,
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate: 256_000,
+                frame_ms: 20.0,
+                content_type: "audio/pcm",
+                codec: "pcm-s16le",
+                framing: "raw",
+            },
+            Self::PcmS16le24k => OutputProfile {
+                name: "pcm-s16le-24k",
+                format: AudioFormat::PcmS16le,
+                sample_rate: 24_000,
+                channels: 1,
+                bitrate: 384_000,
+                frame_ms: 20.0,
+                content_type: "audio/pcm",
+                codec: "pcm-s16le",
+                framing: "raw",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +205,7 @@ struct PreparedStream {
     stream_url: String,
     track_id: String,
     title: String,
+    profile: &'static str,
     content_type: &'static str,
     codec: &'static str,
     framing: &'static str,
@@ -147,7 +232,7 @@ impl EasyMusicMcp {
     }
 
     #[tool(
-        description = "Call only after the selected track is confirmed, or search_music returned needs_confirmation=false. Prepare a one-time, short-lived 24 kHz mono Opus stream, mapping requested offsets to start_seconds and playback limits to duration_seconds. Immediately pass the returned stream_url, title, and artist to xiaozhi_play_stream; the URL is single-use and expires quickly."
+        description = "Call only after the selected track is confirmed, or search_music returned needs_confirmation=false. Prepare a terminal-neutral, one-time audio stream using the requested output profile, mapping offsets to start_seconds and playback limits to duration_seconds. Pass stream_url and its returned format metadata immediately to a compatible playback tool; the URL is single-use and expires quickly."
     )]
     async fn prepare_stream(&self, Parameters(params): Parameters<PrepareStreamParams>) -> String {
         tool_json(self.prepare_stream_inner(params).await)
@@ -187,13 +272,14 @@ impl EasyMusicMcp {
         }
 
         let resolved = self.client.resolve(id).await?;
+        let profile = params.profile.unwrap_or_default().config();
         let config = StreamConfig {
             url: resolved.url,
-            format: AudioFormat::OpusPackets,
-            sample_rate: 24_000,
-            channels: 1,
-            bitrate: 64_000,
-            frame_ms: 60.0,
+            format: profile.format,
+            sample_rate: profile.sample_rate,
+            channels: profile.channels,
+            bitrate: profile.bitrate,
+            frame_ms: profile.frame_ms,
             framing: Framing::Len32be,
             output: None,
             ffmpeg: self.ffmpeg.clone(),
@@ -202,18 +288,19 @@ impl EasyMusicMcp {
             duration_seconds: params.duration_seconds,
             events_json: false,
         };
-        let lease = self.broker.insert(config).await;
+        let lease = self.broker.insert(config, profile.content_type).await;
         Ok(PreparedStream {
             ok: true,
             stream_url: lease.url,
             track_id: id.to_owned(),
             title: resolved.title,
-            content_type: STREAM_CONTENT_TYPE,
-            codec: "opus",
-            framing: "len32be",
-            sample_rate: 24_000,
-            channels: 1,
-            frame_duration_ms: 60,
+            profile: profile.name,
+            content_type: profile.content_type,
+            codec: profile.codec,
+            framing: profile.framing,
+            sample_rate: profile.sample_rate,
+            channels: profile.channels,
+            frame_duration_ms: profile.frame_ms as u32,
             expires_in_seconds: lease.expires_in_seconds,
         })
     }
@@ -281,6 +368,7 @@ async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<St
         )
             .into_response();
     };
+    let content_type = pending.content_type;
     let mut audio = match spawn_audio_stream(&pending.config).await {
         Ok(audio) => audio,
         Err(error) => {
@@ -316,7 +404,7 @@ async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<St
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, STREAM_CONTENT_TYPE)
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -367,10 +455,32 @@ mod tests {
     #[tokio::test]
     async fn stream_leases_are_one_time() {
         let broker = StreamBroker::new("127.0.0.1:1234".parse().unwrap(), Duration::from_secs(30));
-        let lease = broker.insert(config()).await;
+        let lease = broker.insert(config(), STREAM_CONTENT_TYPE).await;
         let token = lease.url.rsplit('/').next().unwrap();
         assert!(broker.take(token).await.is_some());
         assert!(broker.take(token).await.is_none());
+    }
+
+    #[test]
+    fn output_profiles_expose_terminal_specific_metadata() {
+        let xiaozhi = McpOutputProfile::XiaozhiV1.config();
+        assert_eq!(xiaozhi.name, "xiaozhi-v1");
+        assert_eq!(xiaozhi.format, AudioFormat::OpusPackets);
+        assert_eq!(xiaozhi.framing, "len32be");
+        assert_eq!(xiaozhi.sample_rate, 24_000);
+
+        let web = McpOutputProfile::WebOpus.config();
+        assert_eq!(web.format, AudioFormat::OpusOgg);
+        assert_eq!(web.content_type, "audio/ogg");
+        assert_eq!(web.sample_rate, 48_000);
+
+        let pcm = McpOutputProfile::PcmS16le16k.config();
+        assert_eq!(pcm.format, AudioFormat::PcmS16le);
+        assert_eq!(pcm.framing, "raw");
+        assert_eq!(pcm.channels, 1);
+
+        let parsed: McpOutputProfile = serde_json::from_str(r#""pcm-s16le-24k""#).unwrap();
+        assert_eq!(parsed.config().name, "pcm-s16le-24k");
     }
 
     #[test]
