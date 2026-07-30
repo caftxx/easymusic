@@ -1,8 +1,25 @@
 use std::net::{IpAddr, Ipv6Addr};
 
 use tokio::net::lookup_host;
+use url::Url;
 
 use crate::error::{EasyMusicError, Result};
+
+pub fn validate_http_url(value: &str) -> Result<Url> {
+    let url = Url::parse(value)?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(EasyMusicError::source(format!(
+                "unsupported URL scheme {scheme:?}; only http and https are allowed"
+            )));
+        }
+    }
+    if url.host_str().is_none() {
+        return Err(EasyMusicError::source("audio URL has no host"));
+    }
+    Ok(url)
+}
 
 pub(crate) async fn reject_private_host(url: &url::Url) -> Result<()> {
     let host = url
@@ -75,5 +92,11 @@ mod tests {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn rejects_non_http_urls() {
+        let error = validate_http_url("file:///etc/passwd").unwrap_err();
+        assert!(error.message.contains("only http and https"));
     }
 }

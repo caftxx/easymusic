@@ -4,13 +4,13 @@ use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use easy_music::api::DEFAULT_API_BASE_URL;
 use easy_music::mcp_server::{McpServerConfig, serve_mcp};
 use easy_music::model::PlaybackHint;
 use easy_music::{
-    AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
-    MusicClient, PreparedTrack, Result, StreamConfig, Track, download_audio, rank_tracks,
-    select_track, stream_audio,
+    AudioFormat, AudioProfile, DEFAULT_PROVIDER_NAME, DownloadConfig, DownloadedFile,
+    EasyMusicError, ErrorCode, Framing, MusicClient, PreparedTrack, ProviderInfo, Result,
+    StreamConfig, Track, download_audio, rank_tracks, select_track, stream_audio,
+    supported_providers,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -19,14 +19,15 @@ use tokio::process::Command;
 #[derive(Debug, Parser)]
 #[command(name = "easy-music", version, about)]
 struct Cli {
-    /// Music API origin. Useful for compatible mirrors and deterministic tests.
+    /// Music provider name. Run `easy-music provider --list` to list values.
     #[arg(
         long,
         global = true,
-        env = "EASY_MUSIC_API_BASE_URL",
-        default_value = DEFAULT_API_BASE_URL
+        env = "EASY_MUSIC_PROVIDER",
+        default_value = DEFAULT_PROVIDER_NAME,
+        value_name = "NAME"
     )]
-    api_base_url: String,
+    provider: String,
 
     /// Pretty-print metadata JSON. Never applies to binary stream output.
     #[arg(long, global = true)]
@@ -38,6 +39,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Inspect the built-in music providers.
+    Provider(ProviderArgs),
     /// Search by song title or artist keyword.
     Search(SearchArgs),
     /// Rank search results and select the best candidate.
@@ -54,6 +57,13 @@ enum Commands {
     Mcp(McpArgs),
     /// Check ffmpeg and optionally the upstream API.
     Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProviderArgs {
+    /// List all supported provider names.
+    #[arg(long, required = true)]
+    list: bool,
 }
 
 #[derive(Debug, Args)]
@@ -245,8 +255,15 @@ struct DependencyStatus {
 #[derive(Debug, Serialize)]
 struct ApiStatus {
     ok: bool,
-    base_url: String,
+    provider: String,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderListResult {
+    ok: bool,
+    default: &'static str,
+    providers: &'static [ProviderInfo],
 }
 
 #[derive(Debug, Serialize)]
@@ -279,8 +296,23 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
-    let client = MusicClient::new(&cli.api_base_url)?;
+    if let Commands::Provider(args) = &cli.command {
+        if args.list {
+            let result = ProviderListResult {
+                ok: true,
+                default: DEFAULT_PROVIDER_NAME,
+                providers: supported_providers(),
+            };
+            return Ok(Some(
+                serde_json::to_value(result).expect("provider list is serializable"),
+            ));
+        }
+        return Err(EasyMusicError::invalid("provider command requires --list"));
+    }
+
+    let client = MusicClient::new(&cli.provider)?;
     match cli.command {
+        Commands::Provider(_) => unreachable!("provider command handled before client creation"),
         Commands::Search(args) => {
             let mut result = client.search(&args.keyword).await?;
             let ranked = rank_tracks(&result.tracks, Some(&args.keyword), args.artist.as_deref());
@@ -362,12 +394,12 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
                 Some(match client.search("晴天").await {
                     Ok(_) => ApiStatus {
                         ok: true,
-                        base_url: cli.api_base_url,
+                        provider: cli.provider,
                         error: None,
                     },
                     Err(error) => ApiStatus {
                         ok: false,
-                        base_url: cli.api_base_url,
+                        provider: cli.provider,
                         error: Some(error.message),
                     },
                 })
@@ -648,6 +680,35 @@ fn print_error(error: EasyMusicError) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_selects_providers_by_name_and_defaults_to_qianqian() {
+        let default_cli =
+            Cli::try_parse_from(["easy-music", "search", "--keyword", "天地龙鳞"]).unwrap();
+        assert_eq!(default_cli.provider, "qianqian");
+
+        let selected_cli = Cli::try_parse_from([
+            "easy-music",
+            "--provider",
+            "yymp3",
+            "search",
+            "--keyword",
+            "刚好遇见你",
+        ])
+        .unwrap();
+        assert_eq!(selected_cli.provider, "yymp3");
+    }
+
+    #[tokio::test]
+    async fn provider_list_command_returns_the_registry() {
+        let cli = Cli::try_parse_from(["easy-music", "provider", "--list"]).unwrap();
+        let output = run(cli).await.unwrap().unwrap();
+
+        assert_eq!(output["default"], "qianqian");
+        assert_eq!(output["providers"][0]["name"], "qianqian");
+        assert_eq!(output["providers"][1]["name"], "yymp3");
+        assert_eq!(output["providers"][2]["name"], "buguyy");
+    }
 
     #[test]
     fn creates_safe_track_file_names() {

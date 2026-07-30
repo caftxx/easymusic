@@ -36,6 +36,52 @@ cargo build --release
 cargo install --path .
 ```
 
+## Provider architecture
+
+`MusicClient` is a provider-independent facade. It validates public inputs and
+delegates to an injected `MusicProvider`:
+
+```text
+src/api.rs                         MusicClient facade
+src/provider/mod.rs                MusicProvider interface + built-in factory
+src/provider/buguyy.rs             Buguyy implementation and DTOs
+src/provider/qianqian.rs           91Q implementation, signing, and DTOs
+src/provider/yymp3.rs              YYMP3 implementation and HTML parsing
+```
+
+Each provider owns its endpoints, transport details, response DTOs, parsers,
+and focused tests. Adding another built-in source requires a new provider file
+and one factory registration; CLI, MCP, downloading, and streaming code remain
+unchanged.
+
+Library users can inject a custom implementation directly:
+
+```rust,no_run
+use async_trait::async_trait;
+use easy_music::{
+    MusicClient, MusicProvider, ResolvedTrack, Result, SearchResult,
+};
+
+struct MyProvider;
+
+#[async_trait]
+impl MusicProvider for MyProvider {
+    fn name(&self) -> &str {
+        "my-provider"
+    }
+
+    async fn search(&self, keyword: &str) -> Result<SearchResult> {
+        todo!("search {keyword}")
+    }
+
+    async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
+        todo!("resolve {id}")
+    }
+}
+
+let client = MusicClient::with_provider(MyProvider);
+```
+
 Tags matching `v*` publish release archives for:
 
 | Platform | Targets | Archive |
@@ -51,15 +97,41 @@ runtime requirement on every platform.
 ## Agent-facing metadata commands
 
 ```bash
-easy-music search --keyword "晴天" --artist "周杰伦" --pretty
-easy-music select --title "晴天" --artist "周杰伦" --pretty
-easy-music resolve --id "MTEyNjE3ODA=" --pretty
-easy-music prepare --title "晴天" --artist "周杰伦" --target xiaozhi --pretty
+easy-music search --keyword "天地龙鳞" --artist "王力宏" --pretty
+easy-music select --title "天地龙鳞" --artist "王力宏" --pretty
+easy-music resolve --id "T10062480746" --pretty
+easy-music prepare --title "天地龙鳞" --artist "王力宏" --target xiaozhi --pretty
 ```
 
 Do not concatenate title and artist into one upstream keyword. Search by title,
 then use `--artist` for local ranking. This handles providers that return no
 results for combined queries such as `晴天 周杰伦`.
+
+### Provider selection
+
+List all registered providers:
+
+```bash
+easy-music provider --list --pretty
+```
+
+Select a provider by name with the global `--provider` option. The default is
+`qianqian`:
+
+```bash
+easy-music \
+  --provider yymp3 \
+  search --keyword "刚好遇见你" --artist "李玉刚" --pretty
+```
+
+### 91Q / 千千音乐
+
+Search-result `TSID` values are accepted by `resolve`, `stream`, `prepare`,
+`download`, and the MCP server. The adapter resolves the 320 kbit/s source when
+available. Media URLs are signed and short-lived, so resolve immediately before
+playback or downloading. Unauthenticated VIP results are searchable, but
+resolving them returns an `audio_source` error instead of using a preview or
+attempting to bypass account access.
 
 ## MCP server
 
@@ -107,11 +179,11 @@ two-second reconnect delay, while normal end-of-file still completes playback.
 Download the original remote audio bytes without invoking ffmpeg:
 
 ```bash
-# Automatically named "周杰伦 - 晴天.mp3" in the current directory
-easy-music download --title "晴天" --artist "周杰伦" --pretty
+# Automatically named "王力宏 - 天地龙鳞（…）.mp3" in the current directory
+easy-music download --title "天地龙鳞" --artist "王力宏" --pretty
 
 # Download by search-result ID to an exact path
-easy-music download --id "MTEyNjE3ODA=" --output "./music/sunny.mp3" --pretty
+easy-music download --id "T10062480746" --output "./music/song.mp3" --pretty
 
 # Download an already resolved URL into a directory
 easy-music download --url "https://example.com/song.mp3" --output-dir "./music"
@@ -128,7 +200,7 @@ Raw mono 24 kHz signed 16-bit little-endian PCM:
 
 ```bash
 easy-music stream \
-  --id "MTEyNjE3ODA=" \
+  --id "T10062480746" \
   --format pcm-s16le \
   --sample-rate 24000 \
   --channels 1 \
@@ -138,14 +210,14 @@ easy-music stream \
 Streaming Ogg Opus:
 
 ```bash
-easy-music stream --id "MTEyNjE3ODA=" --format opus-ogg --output song.opus
+easy-music stream --id "T10062480746" --format opus-ogg --output song.opus
 ```
 
 xiaozhi-compatible raw Opus packets:
 
 ```bash
 easy-music stream \
-  --id "MTEyNjE3ODA=" \
+  --id "T10062480746" \
   --profile xiaozhi \
   --output -
 ```
@@ -180,8 +252,8 @@ and documentation addresses are rejected unless
 
 Environment variables:
 
-- `EASY_MUSIC_API_BASE_URL`: compatible API origin; defaults to
-  `https://buguyy.top`.
+- `EASY_MUSIC_PROVIDER`: provider name; defaults to `qianqian`. Run
+  `easy-music provider --list` for the supported names.
 - `EASY_MUSIC_FFMPEG`: ffmpeg executable path.
 
 Run diagnostics:
@@ -190,6 +262,7 @@ Run diagnostics:
 easy-music doctor --online --pretty
 ```
 
-The default music source is a third-party service. Its availability, catalog,
-and returned media URLs are outside this project's control. Use audio only
-where you have the right to access and play it.
+The default music source is a third-party service. Its HTML, internal
+JavaScript endpoints, availability, catalog, and returned media URLs are
+outside this project's control. Use audio only where you have the right to
+access and play it.

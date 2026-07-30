@@ -11,6 +11,7 @@ pub mod error;
 pub mod mcp_server;
 pub mod model;
 mod network;
+pub mod provider;
 pub mod ranking;
 pub mod streaming;
 
@@ -21,5 +22,6 @@ pub use model::{
     AudioChunk, AudioChunkKind, AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, Framing,
     PreparedTrack, ResolvedTrack, SearchResult, SelectResult, StreamConfig, StreamStats, Track,
 };
+pub use provider::{DEFAULT_PROVIDER_NAME, MusicProvider, ProviderInfo, supported_providers};
 pub use ranking::{rank_tracks, select_track};
 pub use streaming::{AudioStream, spawn_audio_stream, stream_audio};
