@@ -197,6 +197,9 @@ Tags matching `v*` publish self-contained search/runtime archives for:
 | macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | `.tar.gz` |
 | Windows | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | `.zip` |
 
+Both Linux variants use a statically linked easymusic binary. The target suffix
+selects the matching glibc or musl yt-dlp runtime bundled beside it.
+
 Every archive includes easymusic, yt-dlp, QuickJS (or Deno on Windows ARM64),
 documentation, third-party notices, and a SHA-256 checksum. ffmpeg remains a
 separate optional runtime because it is used only by MCP and library
