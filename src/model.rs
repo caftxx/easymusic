@@ -41,6 +41,8 @@ pub struct ResolvedTrack {
     pub id: String,
     pub title: String,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

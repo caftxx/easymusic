@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{EasyMusicError, ErrorCode};
 use crate::model::{AudioChunk, AudioChunkKind, AudioFormat, Framing, StreamConfig};
-use crate::{AudioStream, MusicClient, select_track, spawn_audio_stream};
+use crate::{AudioStream, MusicClient, default_search_limit, select_track, spawn_audio_stream};
 
 const STREAM_CONTENT_TYPE: &str = "application/x-opus-packets";
 const STREAM_PATH_PREFIX: &str = "/streams/";
@@ -136,12 +136,12 @@ struct StreamLease {
 struct SearchMusicParams {
     #[schemars(
         with = "String",
-        description = "Song title. Keep separate from artist."
+        description = "Song title. It is combined with artist for the yt-dlp search query."
     )]
     title: Option<String>,
     #[schemars(
         with = "String",
-        description = "Optional artist name used for ranking."
+        description = "Optional artist name used for both search and ranking."
     )]
     artist: Option<String>,
 }
@@ -301,11 +301,15 @@ impl EasyMusicMcp {
     ) -> crate::Result<crate::SelectResult> {
         let title = trimmed(params.title);
         let artist = trimmed(params.artist);
-        let keyword = title
-            .as_deref()
-            .or(artist.as_deref())
-            .ok_or_else(|| EasyMusicError::invalid("title or artist is required"))?;
-        let search = self.client.search(keyword).await?;
+        let keyword = [title.as_deref(), artist.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if keyword.is_empty() {
+            return Err(EasyMusicError::invalid("title or artist is required"));
+        }
+        let search = self.client.search(&keyword, default_search_limit()).await?;
         select_track(&search.tracks, title.as_deref(), artist.as_deref())
     }
 

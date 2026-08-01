@@ -1,6 +1,6 @@
 [package]
 name = "easy-music"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-friendly music search, streaming, download, and MCP server"
@@ -19,17 +19,15 @@ path = "src/main.rs"
 
 [dependencies]
 async-stream = "0.3"
-async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 rand = "0.9"
-md5 = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 rmcp = { version = "2.2", features = ["server", "transport-io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.49", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5"
 
 [profile.release]

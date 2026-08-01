@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  YT_DLP_VERSION: "2026.07.04"
+  QUICKJS_VERSION: "0.15.0"
+  DENO_VERSION: "2.8.1"
+
 jobs:
   linux-musl:
     name: Linux musl (${{ matrix.target }})
@@ -29,6 +34,30 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross --rev f8151ae777290430cf2108efacf3976d9528500b --locked
       - name: Build release binary
         run: cross build --locked --release --target "${{ matrix.target }}"
+      - name: Download bundled yt-dlp and QuickJS
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            ytdlp_asset="yt-dlp_musllinux"
+            ytdlp_sha="f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e"
+            qjs_asset="qjs-linux-x86_64"
+            qjs_sha="6f87100b30b2212d529b2024213d27c3ea8082d8b4ec5aec0f01e8a0824c4e1d"
+          else
+            ytdlp_asset="yt-dlp_musllinux_aarch64"
+            ytdlp_sha="9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7"
+            qjs_asset="qjs-linux-aarch64"
+            qjs_sha="72782b85afb49d4c1228495138fd38771fff949a6ecee3d8151077cd127d7072"
+          fi
+          mkdir -p runtime
+          curl --fail --location --silent --show-error \
+            "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${ytdlp_asset}" \
+            --output runtime/yt-dlp
+          curl --fail --location --silent --show-error \
+            "https://github.com/quickjs-ng/quickjs/releases/download/v${QUICKJS_VERSION}/${qjs_asset}" \
+            --output runtime/qjs
+          echo "${ytdlp_sha}  runtime/yt-dlp" | sha256sum --check
+          echo "${qjs_sha}  runtime/qjs" | sha256sum --check
+          chmod 755 runtime/yt-dlp runtime/qjs
       - name: Package release archive
         shell: bash
         run: |
@@ -36,7 +65,8 @@ jobs:
           archive="easy-music-${version}-${{ matrix.target }}"
           mkdir -p "dist/${archive}"
           install -m 755 "target/${{ matrix.target }}/release/easy-music" "dist/${archive}/easy-music"
-          cp README.md LICENSE "dist/${archive}/"
+          install -m 755 runtime/yt-dlp runtime/qjs "dist/${archive}/"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           (cd dist && sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
@@ -76,6 +106,45 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Download bundled yt-dlp and JavaScript runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
+            $ytDlpAsset = "yt-dlp.exe"
+            $ytDlpSha = "52fe3c26dcf71fbdc85b528589020bb0b8e383155cfa81b64dd447bbe35e24b8"
+            $runtimeUri = "https://github.com/quickjs-ng/quickjs/releases/download/v$env:QUICKJS_VERSION/qjs-windows-x86_64.exe"
+            $runtimeArchive = "runtime/qjs.exe"
+            $runtimeSha = "f157d58a9e14e958991e4b0f01b3a6d1d7dc25f3ae78f85c6c8da01c19bf77bf"
+          } elseif ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
+            $ytDlpAsset = "yt-dlp_arm64.exe"
+            $ytDlpSha = "1525690b037ecc0bb677e38e7147b0025179cbc9a8d0c57264e3100b18099280"
+            $runtimeUri = "https://github.com/denoland/deno/releases/download/v$env:DENO_VERSION/deno-aarch64-pc-windows-msvc.zip"
+            $runtimeArchive = "runtime/deno.zip"
+            $runtimeSha = "b0e2ae0e695e9460b62cebf32d0ca4698e914fe2c224cfc034b68a89c793d1d4"
+          } else {
+            $ytDlpAsset = "yt-dlp_macos"
+            $ytDlpSha = "498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b"
+            $runtimeUri = "https://github.com/quickjs-ng/quickjs/releases/download/v$env:QUICKJS_VERSION/qjs-darwin"
+            $runtimeArchive = "runtime/qjs"
+            $runtimeSha = "b17a9e1c23636a831cd94b97ffd79ec78b73941a51e40a8f2c2a0a5d896fa3e4"
+          }
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/download/$env:YT_DLP_VERSION/$ytDlpAsset" -OutFile "runtime/yt-dlp.exe"
+          Invoke-WebRequest -Uri $runtimeUri -OutFile $runtimeArchive
+          if ((Get-FileHash -Algorithm SHA256 "runtime/yt-dlp.exe").Hash.ToLowerInvariant() -ne $ytDlpSha) {
+            throw "yt-dlp checksum mismatch"
+          }
+          if ((Get-FileHash -Algorithm SHA256 $runtimeArchive).Hash.ToLowerInvariant() -ne $runtimeSha) {
+            throw "JavaScript runtime checksum mismatch"
+          }
+          if ($runtimeArchive -eq "runtime/deno.zip") {
+            Expand-Archive -LiteralPath $runtimeArchive -DestinationPath runtime
+            Remove-Item -LiteralPath $runtimeArchive
+          }
+          if ($IsMacOS) {
+            Move-Item -LiteralPath "runtime/yt-dlp.exe" -Destination "runtime/yt-dlp"
+            chmod +x runtime/yt-dlp runtime/qjs
+          }
       - name: Package macOS release archive
         if: runner.os == 'macOS'
         shell: bash
@@ -84,7 +153,8 @@ jobs:
           archive="easy-music-${version}-${{ matrix.target }}"
           mkdir -p "dist/${archive}"
           install -m 755 "target/${{ matrix.target }}/release/easy-music" "dist/${archive}/easy-music"
-          cp README.md LICENSE "dist/${archive}/"
+          install -m 755 runtime/yt-dlp runtime/qjs "dist/${archive}/"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           (cd dist && shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
       - name: Package Windows release archive
@@ -96,7 +166,13 @@ jobs:
           $packageDir = Join-Path "dist" $archive
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/easy-music.exe" $packageDir
-          Copy-Item README.md, LICENSE $packageDir
+          Copy-Item "runtime/yt-dlp.exe" $packageDir
+          if (Test-Path -LiteralPath "runtime/qjs.exe") {
+            Copy-Item "runtime/qjs.exe" $packageDir
+          } else {
+            Copy-Item "runtime/deno.exe" $packageDir
+          }
+          Copy-Item README.md, LICENSE, THIRD-PARTY-NOTICES.md $packageDir
           $archivePath = "$packageDir.zip"
           Compress-Archive -Path $packageDir -DestinationPath $archivePath
           $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()

@@ -1,56 +1,75 @@
-use std::sync::Arc;
-use std::time::Duration;
-
-use reqwest::Client;
+use std::path::{Path, PathBuf};
 
 use crate::error::{EasyMusicError, Result};
 use crate::model::{ResolvedTrack, SearchResult};
-use crate::provider::{MusicProvider, built_in_provider};
+use crate::ytdlp::YtDlp;
 
 pub use crate::network::validate_http_url;
 
-/// Provider-independent facade used by the CLI, MCP server, and library API.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+const MAX_SEARCH_LIMIT: usize = 50;
+
+/// Configuration for the external `yt-dlp` process.
+#[derive(Debug, Clone)]
+pub struct YtDlpConfig {
+    /// Path to the standalone `yt-dlp` executable.
+    pub executable: PathBuf,
+    /// Optional value passed to `yt-dlp --js-runtimes`, such as
+    /// `quickjs:/opt/easy-music/qjs` or `deno:/opt/easy-music/deno`.
+    pub js_runtime: Option<String>,
+    /// Optional Netscape-format cookies file used for restricted YouTube
+    /// requests. This does not require a browser on the server.
+    pub cookies: Option<PathBuf>,
+}
+
+impl Default for YtDlpConfig {
+    fn default() -> Self {
+        Self {
+            executable: default_yt_dlp_executable(),
+            js_runtime: None,
+            cookies: None,
+        }
+    }
+}
+
+/// Music search and audio URL resolution backed exclusively by `yt-dlp`.
 #[derive(Clone)]
 pub struct MusicClient {
-    provider: Arc<dyn MusicProvider>,
+    backend: YtDlp,
 }
 
 impl MusicClient {
-    /// Select a built-in provider by its registered name.
-    pub fn new(provider_name: impl AsRef<str>) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .user_agent(concat!("easy-music/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| EasyMusicError::upstream(error.to_string()))?;
-        Ok(Self {
-            provider: built_in_provider(client, provider_name)?,
-        })
+    /// Discover a bundled `yt-dlp` executable next to `easy-music`, falling
+    /// back to `PATH` when no bundled executable exists.
+    pub fn new() -> Self {
+        Self::with_config(YtDlpConfig::default())
     }
 
-    /// Inject a custom provider implementation.
-    pub fn with_provider(provider: impl MusicProvider + 'static) -> Self {
+    pub fn with_config(config: YtDlpConfig) -> Self {
         Self {
-            provider: Arc::new(provider),
+            backend: YtDlp::new(config),
         }
     }
 
-    /// Inject an already shared provider implementation.
-    pub fn with_shared_provider(provider: Arc<dyn MusicProvider>) -> Self {
-        Self { provider }
+    pub fn yt_dlp_executable(&self) -> &Path {
+        self.backend.executable()
     }
 
-    pub fn provider_name(&self) -> &str {
-        self.provider.name()
+    pub fn js_runtime(&self) -> Option<&str> {
+        self.backend.js_runtime()
     }
 
-    pub async fn search(&self, keyword: &str) -> Result<SearchResult> {
+    pub async fn search(&self, keyword: &str, limit: usize) -> Result<SearchResult> {
         let keyword = keyword.trim();
         if keyword.is_empty() {
             return Err(EasyMusicError::invalid("keyword must not be empty"));
         }
-        self.provider.search(keyword).await
+        if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+            return Err(EasyMusicError::invalid(format!(
+                "search limit must be between 1 and {MAX_SEARCH_LIMIT}"
+            )));
+        }
+        self.backend.search(keyword, limit).await
     }
 
     pub async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
@@ -58,73 +77,91 @@ impl MusicClient {
         if id.is_empty() {
             return Err(EasyMusicError::invalid("track id must not be empty"));
         }
-        self.provider.resolve(id).await
+        if id.len() > 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(EasyMusicError::invalid("track id is not a valid video ID"));
+        }
+        self.backend.resolve(id).await
     }
+}
+
+impl Default for MusicClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn default_search_limit() -> usize {
+    DEFAULT_SEARCH_LIMIT
+}
+
+fn default_yt_dlp_executable() -> PathBuf {
+    let file_name = if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    };
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join(file_name)));
+    bundled
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(file_name))
 }
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::model::Track;
-
-    struct EchoProvider;
-
-    #[async_trait]
-    impl MusicProvider for EchoProvider {
-        fn name(&self) -> &str {
-            "echo"
-        }
-
-        async fn search(&self, keyword: &str) -> Result<SearchResult> {
-            Ok(SearchResult {
-                ok: true,
-                keyword: keyword.to_owned(),
-                count: 1,
-                tracks: vec![Track {
-                    id: "track-id".to_owned(),
-                    title: keyword.to_owned(),
-                    artist: String::new(),
-                    artwork_url: None,
-                }],
-            })
-        }
-
-        async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
-            Ok(ResolvedTrack {
-                id: id.to_owned(),
-                title: "resolved".to_owned(),
-                url: "https://example.com/song.mp3".to_owned(),
-            })
-        }
-    }
 
     #[tokio::test]
-    async fn delegates_to_an_injected_provider_after_validating_input() {
-        let client = MusicClient::with_provider(EchoProvider);
-        assert_eq!(client.provider_name(), "echo");
+    async fn rejects_invalid_inputs_before_starting_yt_dlp() {
+        let client = MusicClient::with_config(YtDlpConfig {
+            executable: PathBuf::from("definitely-not-an-executable"),
+            js_runtime: None,
+            cookies: None,
+        });
 
-        let search = client.search("  song  ").await.unwrap();
-        assert_eq!(search.keyword, "song");
-        assert_eq!(search.tracks[0].title, "song");
-
-        let resolved = client.resolve("  id  ").await.unwrap();
-        assert_eq!(resolved.id, "id");
-        assert!(client.search("   ").await.is_err());
-        assert!(client.resolve("").await.is_err());
+        assert_eq!(
+            client.search("   ", 10).await.unwrap_err().code.exit_code(),
+            2
+        );
+        assert_eq!(
+            client.search("song", 0).await.unwrap_err().code.exit_code(),
+            2
+        );
+        assert_eq!(
+            client
+                .search("song", 51)
+                .await
+                .unwrap_err()
+                .code
+                .exit_code(),
+            2
+        );
+        assert_eq!(client.resolve("").await.unwrap_err().code.exit_code(), 2);
+        assert_eq!(
+            client
+                .resolve("../video")
+                .await
+                .unwrap_err()
+                .code
+                .exit_code(),
+            2
+        );
     }
 
     #[test]
-    fn selects_builtin_providers_without_exposing_protocol_branches() {
-        assert_eq!(
-            MusicClient::new("qianqian").unwrap().provider_name(),
-            "qianqian"
-        );
-        assert_eq!(MusicClient::new("yymp3").unwrap().provider_name(), "yymp3");
-        assert_eq!(
-            MusicClient::new("buguyy").unwrap().provider_name(),
-            "buguyy"
-        );
+    fn explicit_configuration_is_exposed_for_diagnostics() {
+        let client = MusicClient::with_config(YtDlpConfig {
+            executable: PathBuf::from("tools/yt-dlp"),
+            js_runtime: Some("quickjs:tools/qjs".to_owned()),
+            cookies: Some(PathBuf::from("tools/cookies.txt")),
+        });
+
+        assert_eq!(client.yt_dlp_executable(), Path::new("tools/yt-dlp"));
+        assert_eq!(client.js_runtime(), Some("quickjs:tools/qjs"));
     }
 }

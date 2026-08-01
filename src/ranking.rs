@@ -10,7 +10,14 @@ const VARIANT_MARKERS: &[&str] = &[
     "cover",
     "remix",
     "手鼓版",
+    "歌词",
+    "lyric",
+    "无损",
+    "flac",
+    "纯享",
 ];
+
+const ORIGINAL_MARKERS: &[&str] = &["official", "官方", "topic"];
 
 pub fn rank_tracks(
     tracks: &[Track],
@@ -60,6 +67,13 @@ pub fn rank_tracks(
                     .any(|marker| candidate_title.contains(&normalize(marker)))
             {
                 score -= 25;
+            }
+
+            if ORIGINAL_MARKERS.iter().any(|marker| {
+                candidate_title.contains(&normalize(marker))
+                    || candidate_artist.contains(&normalize(marker))
+            }) {
+                score += 20;
             }
 
             // Preserve useful upstream popularity/relevance ordering as a small tiebreak.
@@ -181,5 +195,25 @@ mod tests {
         ];
         let selected = select_track(&tracks, Some("晴天"), Some("周杰伦")).unwrap();
         assert!(selected.needs_confirmation);
+    }
+
+    #[test]
+    fn official_upload_beats_lyrics_and_lossless_reuploads() {
+        let tracks = vec![
+            track("lyrics", "晴天 周杰伦 (歌词版)", "GM Lyric"),
+            track(
+                "official",
+                "周杰倫 Jay Chou【晴天 Sunny Day】-Official Music Video",
+                "周杰倫 Jay Chou",
+            ),
+            track(
+                "flac",
+                "周杰倫 晴天 無損音樂FLAC 歌詞LYRICS 純享",
+                "MusicDelta",
+            ),
+        ];
+
+        let selected = select_track(&tracks, Some("晴天"), Some("周杰伦")).unwrap();
+        assert_eq!(selected.selected.track.id, "official");
     }
 }

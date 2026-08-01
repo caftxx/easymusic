@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
@@ -7,10 +7,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use easy_music::mcp_server::{McpServerConfig, serve_mcp};
 use easy_music::model::PlaybackHint;
 use easy_music::{
-    AudioFormat, AudioProfile, DEFAULT_PROVIDER_NAME, DownloadConfig, DownloadedFile,
-    EasyMusicError, ErrorCode, Framing, MusicClient, PreparedTrack, ProviderInfo, Result,
-    StreamConfig, Track, download_audio, rank_tracks, select_track, stream_audio,
-    supported_providers,
+    AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
+    MusicClient, PreparedTrack, Result, StreamConfig, Track, YtDlpConfig, default_search_limit,
+    download_audio, rank_tracks, select_track, stream_audio,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -19,15 +18,27 @@ use tokio::process::Command;
 #[derive(Debug, Parser)]
 #[command(name = "easy-music", version, about)]
 struct Cli {
-    /// Music provider name. Run `easy-music provider --list` to list values.
+    /// yt-dlp executable path. A bundled executable next to easy-music is preferred by default.
+    #[arg(long, global = true, env = "EASY_MUSIC_YT_DLP", value_name = "PATH")]
+    yt_dlp: Option<PathBuf>,
+
+    /// yt-dlp JavaScript runtime spec, for example quickjs:/app/qjs or deno:/app/deno.
     #[arg(
         long,
         global = true,
-        env = "EASY_MUSIC_PROVIDER",
-        default_value = DEFAULT_PROVIDER_NAME,
-        value_name = "NAME"
+        env = "EASY_MUSIC_JS_RUNTIME",
+        value_name = "RUNTIME[:PATH]"
     )]
-    provider: String,
+    js_runtime: Option<String>,
+
+    /// Netscape-format cookies file for YouTube requests; no server browser is required.
+    #[arg(
+        long,
+        global = true,
+        env = "EASY_MUSIC_YT_DLP_COOKIES",
+        value_name = "PATH"
+    )]
+    cookies: Option<PathBuf>,
 
     /// Pretty-print metadata JSON. Never applies to binary stream output.
     #[arg(long, global = true)]
@@ -39,9 +50,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Inspect the built-in music providers.
-    Provider(ProviderArgs),
-    /// Search by song title or artist keyword.
+    /// Search YouTube through yt-dlp by song title or artist keyword.
     Search(SearchArgs),
     /// Rank search results and select the best candidate.
     Select(SelectArgs),
@@ -55,24 +64,17 @@ enum Commands {
     Download(DownloadArgs),
     /// Serve Agent tools over MCP stdio with loopback streaming URLs.
     Mcp(McpArgs),
-    /// Check ffmpeg and optionally the upstream API.
+    /// Check yt-dlp, ffmpeg, and optionally online search.
     Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Args)]
-struct ProviderArgs {
-    /// List all supported provider names.
-    #[arg(long, required = true)]
-    list: bool,
-}
-
-#[derive(Debug, Args)]
 struct SearchArgs {
-    /// Song title or artist keyword passed to the upstream search API.
+    /// Song title or free-form music search keyword.
     #[arg(long)]
     keyword: String,
 
-    /// Optional artist hint used for local ranking; it is not appended to keyword.
+    /// Optional artist hint appended to the yt-dlp query and used for local ranking.
     #[arg(long)]
     artist: Option<String>,
 
@@ -229,7 +231,7 @@ struct McpArgs {
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
-    /// Also issue a small search request against the configured API.
+    /// Also issue a small YouTube search through yt-dlp.
     #[arg(long)]
     online: bool,
 
@@ -240,8 +242,10 @@ struct DoctorArgs {
 #[derive(Debug, Serialize)]
 struct DoctorResult {
     ok: bool,
+    yt_dlp: DependencyStatus,
     ffmpeg: DependencyStatus,
-    api: Option<ApiStatus>,
+    js_runtime: Option<String>,
+    search: Option<OnlineSearchStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,17 +257,9 @@ struct DependencyStatus {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiStatus {
+struct OnlineSearchStatus {
     ok: bool,
-    provider: String,
     error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderListResult {
-    ok: bool,
-    default: &'static str,
-    providers: &'static [ProviderInfo],
 }
 
 #[derive(Debug, Serialize)]
@@ -296,25 +292,19 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
-    if let Commands::Provider(args) = &cli.command {
-        if args.list {
-            let result = ProviderListResult {
-                ok: true,
-                default: DEFAULT_PROVIDER_NAME,
-                providers: supported_providers(),
-            };
-            return Ok(Some(
-                serde_json::to_value(result).expect("provider list is serializable"),
-            ));
-        }
-        return Err(EasyMusicError::invalid("provider command requires --list"));
+    let mut config = YtDlpConfig::default();
+    if let Some(executable) = cli.yt_dlp {
+        config.executable = executable;
     }
-
-    let client = MusicClient::new(&cli.provider)?;
+    if let Some(js_runtime) = cli.js_runtime {
+        config.js_runtime = Some(js_runtime);
+    }
+    config.cookies = cli.cookies;
+    let client = MusicClient::with_config(config);
     match cli.command {
-        Commands::Provider(_) => unreachable!("provider command handled before client creation"),
         Commands::Search(args) => {
-            let mut result = client.search(&args.keyword).await?;
+            let query = music_query(Some(&args.keyword), args.artist.as_deref())?;
+            let mut result = client.search(&query, args.limit).await?;
             let ranked = rank_tracks(&result.tracks, Some(&args.keyword), args.artist.as_deref());
             result.tracks = ranked
                 .into_iter()
@@ -389,27 +379,35 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
             Ok(None)
         }
         Commands::Doctor(args) => {
+            let yt_dlp = check_dependency(client.yt_dlp_executable(), &["--version"]).await;
             let ffmpeg = check_ffmpeg(&args.ffmpeg).await;
-            let api = if args.online {
-                Some(match client.search("晴天").await {
-                    Ok(_) => ApiStatus {
+            let search = if args.online {
+                Some(match client.search("晴天 周杰伦", 1).await {
+                    Ok(result) if !result.tracks.is_empty() => OnlineSearchStatus {
                         ok: true,
-                        provider: cli.provider,
                         error: None,
                     },
-                    Err(error) => ApiStatus {
+                    Ok(_) => OnlineSearchStatus {
                         ok: false,
-                        provider: cli.provider,
+                        error: Some("yt-dlp search returned no tracks".to_owned()),
+                    },
+                    Err(error) => OnlineSearchStatus {
+                        ok: false,
                         error: Some(error.message),
                     },
                 })
             } else {
                 None
             };
-            let ok = ffmpeg.ok && api.as_ref().is_none_or(|status| status.ok);
-            Ok(Some(
-                serde_json::to_value(DoctorResult { ok, ffmpeg, api }).expect("serializable"),
-            ))
+            let ok = yt_dlp.ok && ffmpeg.ok && search.as_ref().is_none_or(|status| status.ok);
+            let result = DoctorResult {
+                ok,
+                yt_dlp,
+                ffmpeg,
+                js_runtime: client.js_runtime().map(str::to_owned),
+                search,
+            };
+            Ok(Some(serde_json::to_value(result).expect("serializable")))
         }
     }
 }
@@ -424,10 +422,11 @@ async fn run_download(client: &MusicClient, args: DownloadArgs) -> Result<Downlo
         ));
     }
 
-    let (url, track, confidence, needs_confirmation) = if let Some(id) = &args.id {
+    let (url, extension, track, confidence, needs_confirmation) = if let Some(id) = &args.id {
         let resolved = client.resolve(id).await?;
         (
             resolved.url,
+            resolved.extension,
             Some(Track {
                 id: resolved.id,
                 title: resolved.title,
@@ -438,7 +437,7 @@ async fn run_download(client: &MusicClient, args: DownloadArgs) -> Result<Downlo
             None,
         )
     } else if let Some(url) = &args.url {
-        (url.clone(), None, None, None)
+        (url.clone(), None, None, None, None)
     } else {
         let selection =
             select_from_query(client, args.title.as_deref(), args.artist.as_deref()).await?;
@@ -446,13 +445,20 @@ async fn run_download(client: &MusicClient, args: DownloadArgs) -> Result<Downlo
         let resolved = client.resolve(&track.id).await?;
         (
             resolved.url,
+            resolved.extension,
             Some(track),
             Some(selection.confidence),
             Some(selection.needs_confirmation),
         )
     };
 
-    let output = download_output_path(args.output, args.output_dir, track.as_ref(), &url)?;
+    let output = download_output_path(
+        args.output,
+        args.output_dir,
+        track.as_ref(),
+        &url,
+        extension.as_deref(),
+    )?;
     let file = download_audio(&DownloadConfig {
         url,
         output,
@@ -475,11 +481,25 @@ async fn select_from_query(
     title: Option<&str>,
     artist: Option<&str>,
 ) -> Result<easy_music::SelectResult> {
-    let keyword = title.or(artist).ok_or_else(|| {
-        EasyMusicError::new(ErrorCode::InvalidArguments, "title or artist is required")
-    })?;
-    let search = client.search(keyword).await?;
+    let keyword = music_query(title, artist)?;
+    let search = client.search(&keyword, default_search_limit()).await?;
     select_track(&search.tracks, title, artist)
+}
+
+fn music_query(title: Option<&str>, artist: Option<&str>) -> Result<String> {
+    let parts = [title, artist]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err(EasyMusicError::new(
+            ErrorCode::InvalidArguments,
+            "title or artist is required",
+        ));
+    }
+    Ok(parts.join(" "))
 }
 
 fn download_output_path(
@@ -487,6 +507,7 @@ fn download_output_path(
     output_dir: Option<PathBuf>,
     track: Option<&Track>,
     url: &str,
+    preferred_extension: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(output) = output {
         return Ok(output);
@@ -498,11 +519,10 @@ fn download_output_path(
         } else {
             format!("{} - {}", track.artist, track.title)
         };
-        format!(
-            "{}.{}",
-            sanitize_filename_component(&stem),
-            extension_from_url(url)
-        )
+        let extension = preferred_extension
+            .map(str::to_owned)
+            .unwrap_or_else(|| extension_from_url(url));
+        format!("{}.{}", sanitize_filename_component(&stem), extension)
     } else {
         file_name_from_url(url)
     };
@@ -616,9 +636,13 @@ fn stream_config(url: String, args: StreamArgs) -> StreamConfig {
     }
 }
 
-async fn check_ffmpeg(command: &PathBuf) -> DependencyStatus {
+async fn check_ffmpeg(command: &Path) -> DependencyStatus {
+    check_dependency(command, &["-version"]).await
+}
+
+async fn check_dependency(command: &Path, args: &[&str]) -> DependencyStatus {
     match Command::new(command)
-        .arg("-version")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -682,32 +706,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_selects_providers_by_name_and_defaults_to_qianqian() {
-        let default_cli =
-            Cli::try_parse_from(["easy-music", "search", "--keyword", "天地龙鳞"]).unwrap();
-        assert_eq!(default_cli.provider, "qianqian");
-
-        let selected_cli = Cli::try_parse_from([
+    fn cli_accepts_explicit_yt_dlp_and_js_runtime_paths() {
+        let cli = Cli::try_parse_from([
             "easy-music",
-            "--provider",
-            "yymp3",
+            "--yt-dlp",
+            "/opt/easy-music/yt-dlp",
+            "--js-runtime",
+            "quickjs:/opt/easy-music/qjs",
+            "--cookies",
+            "/run/secrets/youtube-cookies.txt",
             "search",
             "--keyword",
-            "刚好遇见你",
+            "天地龙鳞",
         ])
         .unwrap();
-        assert_eq!(selected_cli.provider, "yymp3");
+
+        assert_eq!(cli.yt_dlp, Some(PathBuf::from("/opt/easy-music/yt-dlp")));
+        assert_eq!(
+            cli.js_runtime.as_deref(),
+            Some("quickjs:/opt/easy-music/qjs")
+        );
+        assert_eq!(
+            cli.cookies,
+            Some(PathBuf::from("/run/secrets/youtube-cookies.txt"))
+        );
     }
 
-    #[tokio::test]
-    async fn provider_list_command_returns_the_registry() {
-        let cli = Cli::try_parse_from(["easy-music", "provider", "--list"]).unwrap();
-        let output = run(cli).await.unwrap().unwrap();
-
-        assert_eq!(output["default"], "qianqian");
-        assert_eq!(output["providers"][0]["name"], "qianqian");
-        assert_eq!(output["providers"][1]["name"], "yymp3");
-        assert_eq!(output["providers"][2]["name"], "buguyy");
+    #[test]
+    fn title_and_artist_are_combined_for_yt_dlp_search() {
+        assert_eq!(
+            music_query(Some(" 晴天 "), Some(" 周杰伦 ")).unwrap(),
+            "晴天 周杰伦"
+        );
+        assert_eq!(music_query(None, Some("周杰伦")).unwrap(), "周杰伦");
+        assert!(music_query(Some(" "), None).is_err());
     }
 
     #[test]
@@ -723,9 +755,23 @@ mod tests {
             Some(PathBuf::from("music")),
             Some(&track),
             "https://example.com/song.MP3?token=temporary",
+            None,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("music/周杰伦 - 晴天_ Live_.mp3"));
+
+        let yt_dlp_path = download_output_path(
+            None,
+            Some(PathBuf::from("music")),
+            Some(&track),
+            "https://example.googlevideo.com/videoplayback?token=temporary",
+            Some("webm"),
+        )
+        .unwrap();
+        assert_eq!(
+            yt_dlp_path,
+            PathBuf::from("music/周杰伦 - 晴天_ Live_.webm")
+        );
     }
 
     #[test]

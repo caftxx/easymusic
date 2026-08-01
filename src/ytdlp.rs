@@ -1,0 +1,353 @@
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde::Deserialize;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+use crate::api::{YtDlpConfig, validate_http_url};
+use crate::error::{EasyMusicError, ErrorCode, Result};
+use crate::model::{ResolvedTrack, SearchResult, Track};
+
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(45);
+const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
+
+#[derive(Debug, Clone)]
+pub(crate) struct YtDlp {
+    executable: PathBuf,
+    js_runtime: Option<String>,
+    cookies: Option<PathBuf>,
+}
+
+impl YtDlp {
+    pub(crate) fn new(mut config: YtDlpConfig) -> Self {
+        if config.js_runtime.is_none() {
+            config.js_runtime = discover_adjacent_js_runtime(&config.executable);
+        }
+        Self {
+            executable: config.executable,
+            js_runtime: config.js_runtime,
+            cookies: config.cookies,
+        }
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) fn js_runtime(&self) -> Option<&str> {
+        self.js_runtime.as_deref()
+    }
+
+    pub(crate) async fn search(&self, keyword: &str, limit: usize) -> Result<SearchResult> {
+        let search = format!("ytsearch{limit}:{keyword}");
+        let output = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "--skip-download",
+                    "--dump-single-json",
+                    &search,
+                ],
+                SEARCH_TIMEOUT,
+                ErrorCode::UpstreamApi,
+                "search",
+            )
+            .await?;
+        parse_search_output(keyword, &output)
+    }
+
+    pub(crate) async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
+        let page_url = format!("{YOUTUBE_WATCH_URL}{id}");
+        let output = self
+            .run(
+                &[
+                    "--skip-download",
+                    "--no-playlist",
+                    "--format",
+                    "bestaudio/best",
+                    "--dump-single-json",
+                    &page_url,
+                ],
+                RESOLVE_TIMEOUT,
+                ErrorCode::AudioSource,
+                "audio URL resolution",
+            )
+            .await?;
+        parse_resolve_output(id, &output)
+    }
+
+    async fn run(
+        &self,
+        operation_args: &[&str],
+        deadline: Duration,
+        failure_code: ErrorCode,
+        operation: &str,
+    ) -> Result<Vec<u8>> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args([
+                "--ignore-config",
+                "--no-warnings",
+                "--no-progress",
+                "--no-update",
+            ])
+            .args(
+                self.js_runtime
+                    .as_ref()
+                    .map(|runtime| ["--js-runtimes", runtime.as_str()])
+                    .into_iter()
+                    .flatten(),
+            )
+            .args(
+                self.cookies
+                    .as_ref()
+                    .map(|cookies| ["--cookies".as_ref(), cookies.as_os_str()])
+                    .into_iter()
+                    .flatten(),
+            )
+            .args(operation_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = timeout(deadline, command.output())
+            .await
+            .map_err(|_| {
+                EasyMusicError::new(
+                    failure_code,
+                    format!(
+                        "yt-dlp {operation} timed out after {} seconds",
+                        deadline.as_secs()
+                    ),
+                )
+            })?
+            .map_err(|error| start_error(&self.executable, error))?;
+
+        if !output.status.success() {
+            let detail = concise_stderr(&output.stderr);
+            let message = if detail.is_empty() {
+                format!("yt-dlp {operation} failed with {}", output.status)
+            } else {
+                format!("yt-dlp {operation} failed: {detail}")
+            };
+            return Err(EasyMusicError::new(failure_code, message));
+        }
+        Ok(output.stdout)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchPage {
+    #[serde(default)]
+    entries: Vec<Option<SearchEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchEntry {
+    id: Option<String>,
+    title: Option<String>,
+    artist: Option<String>,
+    #[serde(default)]
+    artists: Vec<String>,
+    channel: Option<String>,
+    uploader: Option<String>,
+    thumbnail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedEntry {
+    id: Option<String>,
+    title: Option<String>,
+    url: Option<String>,
+    ext: Option<String>,
+}
+
+fn parse_search_output(keyword: &str, output: &[u8]) -> Result<SearchResult> {
+    let page: SearchPage = serde_json::from_slice(output).map_err(|error| {
+        EasyMusicError::upstream(format!("yt-dlp returned invalid search JSON: {error}"))
+    })?;
+    let tracks = page
+        .entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let id = non_empty(entry.id?)?;
+            let title = non_empty(entry.title?)?;
+            let artist = entry
+                .artist
+                .and_then(non_empty)
+                .or_else(|| entry.artists.into_iter().find_map(non_empty))
+                .or_else(|| entry.channel.and_then(non_empty))
+                .or_else(|| entry.uploader.and_then(non_empty))
+                .unwrap_or_default();
+            Some(Track {
+                id,
+                title,
+                artist,
+                artwork_url: entry.thumbnail.and_then(non_empty),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(SearchResult {
+        ok: true,
+        keyword: keyword.to_owned(),
+        count: tracks.len(),
+        tracks,
+    })
+}
+
+fn parse_resolve_output(requested_id: &str, output: &[u8]) -> Result<ResolvedTrack> {
+    let entry: ResolvedEntry = serde_json::from_slice(output).map_err(|error| {
+        EasyMusicError::source(format!("yt-dlp returned invalid audio JSON: {error}"))
+    })?;
+    let url = entry
+        .url
+        .and_then(non_empty)
+        .ok_or_else(|| EasyMusicError::source("yt-dlp did not return a playable audio URL"))?;
+    validate_http_url(&url)?;
+    Ok(ResolvedTrack {
+        id: entry
+            .id
+            .and_then(non_empty)
+            .unwrap_or_else(|| requested_id.to_owned()),
+        title: entry
+            .title
+            .and_then(non_empty)
+            .unwrap_or_else(|| requested_id.to_owned()),
+        url,
+        extension: entry.ext.and_then(valid_extension),
+    })
+}
+
+fn discover_adjacent_js_runtime(executable: &Path) -> Option<String> {
+    let parent = executable
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    let deno = parent.join(if cfg!(windows) { "deno.exe" } else { "deno" });
+    if deno.is_file() {
+        return Some(format!("deno:{}", deno.display()));
+    }
+    let quickjs = parent.join(if cfg!(windows) { "qjs.exe" } else { "qjs" });
+    quickjs
+        .is_file()
+        .then(|| format!("quickjs:{}", quickjs.display()))
+}
+
+fn start_error(executable: &Path, error: io::Error) -> EasyMusicError {
+    if error.kind() == io::ErrorKind::NotFound {
+        EasyMusicError::new(
+            ErrorCode::DependencyMissing,
+            format!(
+                "yt-dlp executable not found at {}; bundle it next to easy-music or set EASY_MUSIC_YT_DLP",
+                executable.display()
+            ),
+        )
+    } else {
+        EasyMusicError::new(
+            ErrorCode::DependencyMissing,
+            format!(
+                "failed to start yt-dlp at {}: {error}",
+                executable.display()
+            ),
+        )
+    }
+}
+
+fn concise_stderr(stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if text.chars().count() > 600 {
+        text = text.chars().take(597).collect::<String>() + "...";
+    }
+    text
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn valid_extension(value: String) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    ((1..=10).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_flat_youtube_search_results() {
+        let output = r#"{
+            "entries": [
+                {
+                    "id": "DYptgVvkVLQ",
+                    "title": "周杰伦 Jay Chou【晴天 Sunny Day】",
+                    "channel": "杰威尔音乐 JVR Music",
+                    "thumbnail": "https://i.ytimg.com/vi/DYptgVvkVLQ/hqdefault.jpg"
+                },
+                {
+                    "id": "second_id-1",
+                    "title": "晴天",
+                    "artist": "周杰伦",
+                    "artists": ["ignored"],
+                    "uploader": "ignored"
+                },
+                null,
+                {"id": "missing-title"}
+            ]
+        }"#;
+
+        let result = parse_search_output("晴天 周杰伦", output.as_bytes()).unwrap();
+        assert_eq!(result.keyword, "晴天 周杰伦");
+        assert_eq!(result.count, 2);
+        assert_eq!(result.tracks[0].id, "DYptgVvkVLQ");
+        assert_eq!(result.tracks[0].artist, "杰威尔音乐 JVR Music");
+        assert_eq!(result.tracks[1].artist, "周杰伦");
+    }
+
+    #[test]
+    fn parses_selected_audio_format_url() {
+        let output = r#"{
+            "id": "DYptgVvkVLQ",
+            "title": "周杰伦 Jay Chou【晴天 Sunny Day】",
+            "url": "https://rr1---sn.example.googlevideo.com/videoplayback?expire=1",
+            "ext": "webm"
+        }"#;
+
+        let resolved = parse_resolve_output("DYptgVvkVLQ", output.as_bytes()).unwrap();
+        assert_eq!(resolved.id, "DYptgVvkVLQ");
+        assert!(resolved.url.starts_with("https://"));
+        assert_eq!(resolved.extension.as_deref(), Some("webm"));
+    }
+
+    #[test]
+    fn rejects_missing_or_non_http_audio_urls() {
+        let missing = parse_resolve_output("id", br#"{"id":"id"}"#).unwrap_err();
+        assert!(matches!(missing.code, ErrorCode::AudioSource));
+
+        let non_http =
+            parse_resolve_output("id", br#"{"id":"id","url":"file:///tmp/audio"}"#).unwrap_err();
+        assert!(matches!(non_http.code, ErrorCode::AudioSource));
+    }
+
+    #[test]
+    fn trims_and_limits_subprocess_errors() {
+        let stderr = format!("\n  first line  \nsecond line\n{}", "x".repeat(1000));
+        let message = concise_stderr(stderr.as_bytes());
+        assert!(message.starts_with("first line | second line | "));
+        assert!(message.ends_with("..."));
+        assert!(message.chars().count() <= 600);
+    }
+}
