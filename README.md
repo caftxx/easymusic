@@ -192,7 +192,8 @@ Tags matching `v*` publish self-contained search/runtime archives for:
 
 | Platform | Targets | Archive |
 | --- | --- | --- |
-| Linux | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | `.tar.gz` |
+| Linux (glibc) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `.tar.gz` |
+| Linux (musl) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | `.tar.gz` |
 | macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | `.tar.gz` |
 | Windows | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | `.zip` |
 

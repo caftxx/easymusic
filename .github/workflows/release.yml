@@ -15,13 +15,15 @@ env:
   DENO_VERSION: "2.8.1"
 
 jobs:
-  linux-musl:
-    name: Linux musl (${{ matrix.target }})
+  linux:
+    name: Linux (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
@@ -37,17 +39,32 @@ jobs:
       - name: Download bundled yt-dlp and QuickJS
         shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            ytdlp_asset="yt-dlp_musllinux"
-            ytdlp_sha="f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e"
-            qjs_asset="qjs-linux-x86_64"
-            qjs_sha="6f87100b30b2212d529b2024213d27c3ea8082d8b4ec5aec0f01e8a0824c4e1d"
-          else
-            ytdlp_asset="yt-dlp_musllinux_aarch64"
-            ytdlp_sha="9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7"
-            qjs_asset="qjs-linux-aarch64"
-            qjs_sha="72782b85afb49d4c1228495138fd38771fff949a6ecee3d8151077cd127d7072"
-          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              ytdlp_asset="yt-dlp_linux"
+              ytdlp_sha="6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae"
+              qjs_asset="qjs-linux-x86_64"
+              qjs_sha="6f87100b30b2212d529b2024213d27c3ea8082d8b4ec5aec0f01e8a0824c4e1d"
+              ;;
+            aarch64-unknown-linux-gnu)
+              ytdlp_asset="yt-dlp_linux_aarch64"
+              ytdlp_sha="b6ce97646773070d7a7ffd6bbbdcaecb47c48483909c54c915bf08a7a9b5e0b1"
+              qjs_asset="qjs-linux-aarch64"
+              qjs_sha="72782b85afb49d4c1228495138fd38771fff949a6ecee3d8151077cd127d7072"
+              ;;
+            x86_64-unknown-linux-musl)
+              ytdlp_asset="yt-dlp_musllinux"
+              ytdlp_sha="f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e"
+              qjs_asset="qjs-linux-x86_64"
+              qjs_sha="6f87100b30b2212d529b2024213d27c3ea8082d8b4ec5aec0f01e8a0824c4e1d"
+              ;;
+            aarch64-unknown-linux-musl)
+              ytdlp_asset="yt-dlp_musllinux_aarch64"
+              ytdlp_sha="9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7"
+              qjs_asset="qjs-linux-aarch64"
+              qjs_sha="72782b85afb49d4c1228495138fd38771fff949a6ecee3d8151077cd127d7072"
+              ;;
+          esac
           mkdir -p runtime
           curl --fail --location --silent --show-error \
             "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${ytdlp_asset}" \
@@ -190,7 +207,7 @@ jobs:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
     needs:
-      - linux-musl
+      - linux
       - native
     runs-on: ubuntu-latest
     permissions:
