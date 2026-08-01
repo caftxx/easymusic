@@ -12,7 +12,7 @@ use crate::error::{EasyMusicError, ErrorCode, Result};
 use crate::model::{ResolvedTrack, SearchResult, Track};
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(45);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(90);
 const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 
 #[derive(Debug, Clone)]

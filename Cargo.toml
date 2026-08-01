@@ -1,6 +1,6 @@
 [package]
 name = "easymusic"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-friendly music search and download CLI with an MCP audio server"
