@@ -3,13 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use easymusic::mcp_server::{McpServerConfig, serve_mcp};
-use easymusic::model::PlaybackHint;
 use easymusic::{
-    AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
-    MusicClient, PreparedTrack, Result, StreamConfig, Track, YtDlpConfig, default_search_limit,
-    download_audio, rank_tracks, select_track, stream_audio,
+    DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, MusicClient, Result, Track,
+    YtDlpConfig, default_search_limit, download_audio, rank_tracks, select_track,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -40,7 +38,7 @@ struct Cli {
     )]
     cookies: Option<PathBuf>,
 
-    /// Pretty-print metadata JSON. Never applies to binary stream output.
+    /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pretty: bool,
 
@@ -52,14 +50,6 @@ struct Cli {
 enum Commands {
     /// Search YouTube through yt-dlp by song title or artist keyword.
     Search(SearchArgs),
-    /// Rank search results and select the best candidate.
-    Select(SelectArgs),
-    /// Resolve a search-result ID to a temporary playable URL.
-    Resolve(ResolveArgs),
-    /// Select and resolve a track in one Agent-friendly operation.
-    Prepare(PrepareArgs),
-    /// Stream a remote track through ffmpeg as PCM or Opus.
-    Stream(StreamArgs),
     /// Download the original remote audio file without transcoding.
     Download(DownloadArgs),
     /// Serve Agent tools over MCP stdio with loopback streaming URLs.
@@ -80,104 +70,6 @@ struct SearchArgs {
 
     #[arg(long, default_value_t = 10)]
     limit: usize,
-}
-
-#[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("query")
-        .required(true)
-        .multiple(true)
-        .args(["title", "artist"])
-))]
-struct SelectArgs {
-    #[arg(long)]
-    title: Option<String>,
-    #[arg(long)]
-    artist: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct ResolveArgs {
-    #[arg(long)]
-    id: String,
-}
-
-#[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("query")
-        .required(true)
-        .multiple(true)
-        .args(["title", "artist"])
-))]
-struct PrepareArgs {
-    #[arg(long)]
-    title: Option<String>,
-    #[arg(long)]
-    artist: Option<String>,
-    #[arg(long, value_enum, default_value = "web-voice")]
-    target: AudioProfile,
-}
-
-#[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("source")
-        .required(true)
-        .multiple(false)
-        .args(["id", "url"])
-))]
-struct StreamArgs {
-    /// Resolve this track ID immediately before streaming.
-    #[arg(long)]
-    id: Option<String>,
-
-    /// Stream an already resolved HTTP(S) URL.
-    #[arg(long)]
-    url: Option<String>,
-
-    /// Apply terminal defaults. Explicit format/rate/channel flags override it.
-    #[arg(long, value_enum)]
-    profile: Option<AudioProfile>,
-
-    #[arg(long, value_enum)]
-    format: Option<AudioFormat>,
-
-    #[arg(long)]
-    sample_rate: Option<u32>,
-
-    #[arg(long)]
-    channels: Option<u8>,
-
-    /// Opus bitrate in bits per second.
-    #[arg(long)]
-    bitrate: Option<u32>,
-
-    /// Opus frame duration in milliseconds.
-    #[arg(long)]
-    frame_ms: Option<f32>,
-
-    #[arg(long, value_enum, default_value = "len32be")]
-    framing: Framing,
-
-    /// Destination path, or '-' for binary stdout.
-    #[arg(long, default_value = "-")]
-    output: String,
-
-    #[arg(long, env = "EASYMUSIC_FFMPEG", default_value = "ffmpeg")]
-    ffmpeg: PathBuf,
-
-    /// Permit localhost, private, and link-local source URLs.
-    #[arg(long)]
-    allow_private_network: bool,
-
-    #[arg(long)]
-    start_seconds: Option<f64>,
-
-    #[arg(long)]
-    duration_seconds: Option<f64>,
-
-    /// Emit stream lifecycle JSON lines on stderr.
-    #[arg(long)]
-    events_json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -313,54 +205,6 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
                 .collect();
             result.count = result.tracks.len();
             Ok(Some(serde_json::to_value(result).expect("serializable")))
-        }
-        Commands::Select(args) => {
-            let result =
-                select_from_query(&client, args.title.as_deref(), args.artist.as_deref()).await?;
-            Ok(Some(serde_json::to_value(result).expect("serializable")))
-        }
-        Commands::Resolve(args) => {
-            let result = client.resolve(&args.id).await?;
-            Ok(Some(json!({"ok": true, "track": result})))
-        }
-        Commands::Prepare(args) => {
-            let selection =
-                select_from_query(&client, args.title.as_deref(), args.artist.as_deref()).await?;
-            let resolved = client.resolve(&selection.selected.track.id).await?;
-            let playback = match args.target {
-                AudioProfile::WebVoice => PlaybackHint {
-                    mode: "remote_url".to_owned(),
-                    profile: None,
-                },
-                profile => PlaybackHint {
-                    mode: "stream".to_owned(),
-                    profile: Some(profile),
-                },
-            };
-            let result = PreparedTrack {
-                ok: true,
-                track: selection.selected.track,
-                url: resolved.url,
-                confidence: selection.confidence,
-                needs_confirmation: selection.needs_confirmation,
-                playback,
-                alternatives: selection.alternatives,
-            };
-            Ok(Some(serde_json::to_value(result).expect("serializable")))
-        }
-        Commands::Stream(args) => {
-            let url = match (&args.id, &args.url) {
-                (Some(id), None) => client.resolve(id).await?.url,
-                (None, Some(url)) => url.clone(),
-                _ => {
-                    return Err(EasyMusicError::invalid(
-                        "provide exactly one of --id or --url",
-                    ));
-                }
-            };
-            let config = stream_config(url, args);
-            stream_audio(&config).await?;
-            Ok(None)
         }
         Commands::Download(args) => {
             let result = run_download(&client, args).await?;
@@ -609,33 +453,6 @@ fn sanitize_filename_component(value: &str) -> String {
     sanitized
 }
 
-fn stream_config(url: String, args: StreamArgs) -> StreamConfig {
-    let profile = args.profile;
-    let (default_format, default_rate, default_channels, default_bitrate, default_frame_ms) =
-        match profile {
-            Some(AudioProfile::Xiaozhi) => (AudioFormat::OpusPackets, 24_000, 1, 64_000, 60.0),
-            Some(AudioProfile::WebVoice) => (AudioFormat::OpusOgg, 48_000, 2, 96_000, 20.0),
-            Some(AudioProfile::Pcm16k) => (AudioFormat::PcmS16le, 16_000, 1, 64_000, 20.0),
-            Some(AudioProfile::Pcm24k) => (AudioFormat::PcmS16le, 24_000, 1, 64_000, 20.0),
-            None => (AudioFormat::PcmS16le, 24_000, 1, 64_000, 20.0),
-        };
-    StreamConfig {
-        url,
-        format: args.format.unwrap_or(default_format),
-        sample_rate: args.sample_rate.unwrap_or(default_rate),
-        channels: args.channels.unwrap_or(default_channels),
-        bitrate: args.bitrate.unwrap_or(default_bitrate),
-        frame_ms: args.frame_ms.unwrap_or(default_frame_ms),
-        framing: args.framing,
-        output: (args.output != "-").then(|| PathBuf::from(args.output)),
-        ffmpeg: args.ffmpeg,
-        allow_private_network: args.allow_private_network,
-        start_seconds: args.start_seconds,
-        duration_seconds: args.duration_seconds,
-        events_json: args.events_json,
-    }
-}
-
 async fn check_ffmpeg(command: &Path) -> DependencyStatus {
     check_dependency(command, &["-version"]).await
 }
@@ -704,6 +521,17 @@ fn print_error(error: EasyMusicError) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_exposes_only_search_download_mcp_and_doctor() {
+        let subcommands = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(subcommands, ["search", "download", "mcp", "doctor"]);
+    }
 
     #[test]
     fn cli_accepts_explicit_yt_dlp_and_js_runtime_paths() {

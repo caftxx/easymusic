@@ -1,18 +1,15 @@
 # easymusic
 
-Agent-friendly music search, selection, downloading, audio transcoding, and MCP
-server. Music discovery and playable URL resolution are implemented exclusively
-through `yt-dlp`; the old site-specific provider adapters have been removed.
+Agent-friendly music search and downloading CLI, plus an MCP server for search
+and audio streaming. Music discovery and playable URL resolution are
+implemented exclusively through `yt-dlp`; the old site-specific provider
+adapters have been removed.
 
 The metadata and audio paths remain separate:
 
 - `search` calls `ytsearchN:` with a flat playlist and returns stable JSON.
-- `select` ranks the search results locally.
-- `resolve` asks `yt-dlp` for the best audio format immediately before use and
-  returns its temporary HTTP(S) URL.
-- `download` streams that original audio format directly to disk.
-- `stream` sends the URL through ffmpeg as PCM, Ogg Opus, or framed Opus
-  packets.
+- `download` searches and ranks by title/artist or accepts an ID/URL, then
+  streams the original audio format directly to disk.
 - `mcp` exposes search and one-time streaming preparation tools over stdio.
 
 No browser, browser engine, page DOM parser, or Python installation is needed
@@ -43,8 +40,8 @@ When building or installing easymusic yourself, provide:
 - Rust 1.88 or newer to build.
 - A current standalone `yt-dlp` executable.
 - QuickJS-NG 0.12+ or Deno 2.3+ for current YouTube extraction.
-- `ffmpeg` on `PATH` only for `stream`, `prepare` with a streaming profile, and
-  MCP audio output. Search, resolve, and direct download do not invoke ffmpeg.
+- `ffmpeg` on `PATH` only for MCP audio output and the library streaming API.
+  CLI search and download do not invoke ffmpeg.
 
 Paths can be overridden without relying on machine-wide installations:
 
@@ -62,7 +59,8 @@ Some server/datacenter IPs are challenged by YouTube. Export a Netscape-format
 `cookies.txt` on an authorized machine and mount it read-only on the server:
 
 ```bash
-easymusic --cookies /run/secrets/youtube-cookies.txt resolve --id "DYptgVvkVLQ"
+easymusic --cookies /run/secrets/youtube-cookies.txt \
+  search --keyword "晴天" --artist "周杰伦"
 ```
 
 `EASYMUSIC_YT_DLP_COOKIES` is the environment-variable equivalent. The server
@@ -80,19 +78,16 @@ cargo install --path .
 deployment, use a release archive or place standalone yt-dlp and QuickJS/Deno
 beside the installed easymusic executable.
 
-## Searching and resolving
+## Searching
 
 ```bash
 easymusic search --keyword "天地龙鳞" --artist "王力宏" --limit 10 --pretty
-easymusic select --title "天地龙鳞" --artist "王力宏" --pretty
-easymusic resolve --id "DYptgVvkVLQ" --pretty
-easymusic prepare --title "天地龙鳞" --artist "王力宏" --target xiaozhi --pretty
 ```
 
 When both title and artist are supplied, easymusic searches for both (for
 example `天地龙鳞 王力宏`) and then uses the separate values for local ranking.
-Search IDs are YouTube video IDs. Resolved media URLs are short-lived, so they
-should be consumed immediately and must not be persisted as catalog data.
+Search IDs are YouTube video IDs. Download resolves the selected ID immediately
+before transfer because resolved media URLs are short-lived.
 
 The library API uses the same backend:
 
@@ -130,25 +125,9 @@ easymusic download --url "https://example.com/song.mp3" --output-dir "./music"
 Downloads use a temporary sibling file and are installed atomically after
 completion. Existing files are preserved unless `--force` is supplied.
 
-## Streaming
+## Library streaming
 
-Raw mono 24 kHz signed 16-bit little-endian PCM:
-
-```bash
-easymusic stream \
-  --id "DYptgVvkVLQ" \
-  --format pcm-s16le \
-  --sample-rate 24000 \
-  --channels 1 \
-  --output - > song.pcm
-```
-
-Other common forms:
-
-```bash
-easymusic stream --id "DYptgVvkVLQ" --format opus-ogg --output song.opus
-easymusic stream --id "DYptgVvkVLQ" --profile xiaozhi --output -
-```
+Audio transcoding remains available to Rust integrations and the MCP server.
 
 Available profiles:
 
@@ -219,13 +198,14 @@ Tags matching `v*` publish self-contained search/runtime archives for:
 
 Every archive includes easymusic, yt-dlp, QuickJS (or Deno on Windows ARM64),
 documentation, third-party notices, and a SHA-256 checksum. ffmpeg remains a
-separate optional runtime because it is used only by transcoding/streaming.
+separate optional runtime because it is used only by MCP and library
+transcoding/streaming.
 
 ## Safety and usage
 
-Only HTTP and HTTPS audio sources are accepted. Download and streaming reject
-private, loopback, link-local, and documentation addresses unless
-`--allow-private-network` is explicitly supplied.
+Only HTTP and HTTPS audio sources are accepted. Direct-URL downloads and
+library streaming reject private, loopback, link-local, and documentation
+addresses unless explicitly allowed by their flag or configuration.
 
 yt-dlp search and extraction depend on YouTube behavior and may require regular
 yt-dlp updates. Use media only where you have the right to access, download,
