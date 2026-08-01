@@ -2,8 +2,7 @@
 
 Agent-friendly music search and downloading CLI, plus an MCP server for search
 and audio streaming. Music discovery and playable URL resolution are
-implemented exclusively through `yt-dlp`; the old site-specific provider
-adapters have been removed.
+implemented exclusively through `yt-dlp`.
 
 The metadata and audio paths remain separate:
 
