@@ -229,7 +229,7 @@ fn build_ffmpeg_command(config: &StreamConfig) -> Command {
         "-reconnect_delay_max",
         HTTP_RECONNECT_DELAY_MAX_SECONDS,
         "-user_agent",
-        concat!("easy-music/", env!("CARGO_PKG_VERSION")),
+        concat!("easymusic/", env!("CARGO_PKG_VERSION")),
         "-i",
         &config.url,
         "-map",

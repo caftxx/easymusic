@@ -1,20 +1,20 @@
 [package]
-name = "easy-music"
+name = "easymusic"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-friendly music search, streaming, download, and MCP server"
 license = "MIT"
-repository = "https://github.com/caftxx/easy-music"
+repository = "https://github.com/caftxx/easymusic"
 keywords = ["music", "audio", "streaming", "agent", "cli"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [lib]
-name = "easy_music"
+name = "easymusic"
 path = "src/lib.rs"
 
 [[bin]]
-name = "easy-music"
+name = "easymusic"
 path = "src/main.rs"
 
 [dependencies]

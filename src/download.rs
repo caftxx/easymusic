@@ -26,7 +26,7 @@ pub async fn download_audio(config: &DownloadConfig) -> Result<DownloadedFile> {
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("easy-music/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("easymusic/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| EasyMusicError::source(error.to_string()))?;
     let initial_url = validate_http_url(&config.url)?;
@@ -187,7 +187,7 @@ async fn create_temporary_file(output: &Path) -> Result<(File, PathBuf)> {
 
     for attempt in 0..TEMP_FILE_ATTEMPTS {
         let temporary_path = parent.join(format!(
-            ".{file_name}.easy-music-{}-{attempt}.part",
+            ".{file_name}.easymusic-{}-{attempt}.part",
             std::process::id()
         ));
         match OpenOptions::new()
@@ -246,7 +246,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let output = std::env::temp_dir().join(format!("easy-music-{unique}.mp3"));
+        let output = std::env::temp_dir().join(format!("easymusic-{unique}.mp3"));
         let result = download_audio(&DownloadConfig {
             url: format!("http://{address}/song.mp3"),
             output: output.clone(),

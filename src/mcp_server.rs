@@ -402,7 +402,7 @@ pub async fn serve_mcp(client: MusicClient, config: McpServerConfig) -> crate::R
         .with_state(broker.clone());
     let http_task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
-            eprintln!("easy-music stream server failed: {error}");
+            eprintln!("easymusic stream server failed: {error}");
         }
     });
 
@@ -447,7 +447,7 @@ async fn stream_handler(State(broker): State<StreamBroker>, Path(token): Path<St
             yield frame_stream_chunk(chunk);
         }
         if let Err(error) = pending.audio.finish().await {
-            eprintln!("easy-music stream failed: {}", error.message);
+            eprintln!("easymusic stream failed: {}", error.message);
             yield Err(io::Error::other(error.message));
         }
     };
@@ -489,7 +489,7 @@ fn frame_stream_chunk(chunk: AudioChunk) -> Result<Bytes, io::Error> {
         return Ok(Bytes::from(chunk.data));
     }
     let length = u32::try_from(chunk.data.len())
-        .map_err(|_| io::Error::other("easy-music Opus packet exceeded u32 length"))?;
+        .map_err(|_| io::Error::other("easymusic Opus packet exceeded u32 length"))?;
     let mut framed = Vec::with_capacity(4 + chunk.data.len());
     framed.extend_from_slice(&length.to_be_bytes());
     framed.extend_from_slice(&chunk.data);

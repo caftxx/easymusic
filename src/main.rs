@@ -4,9 +4,9 @@ use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use easy_music::mcp_server::{McpServerConfig, serve_mcp};
-use easy_music::model::PlaybackHint;
-use easy_music::{
+use easymusic::mcp_server::{McpServerConfig, serve_mcp};
+use easymusic::model::PlaybackHint;
+use easymusic::{
     AudioFormat, AudioProfile, DownloadConfig, DownloadedFile, EasyMusicError, ErrorCode, Framing,
     MusicClient, PreparedTrack, Result, StreamConfig, Track, YtDlpConfig, default_search_limit,
     download_audio, rank_tracks, select_track, stream_audio,
@@ -16,17 +16,17 @@ use serde_json::json;
 use tokio::process::Command;
 
 #[derive(Debug, Parser)]
-#[command(name = "easy-music", version, about)]
+#[command(name = "easymusic", version, about)]
 struct Cli {
-    /// yt-dlp executable path. A bundled executable next to easy-music is preferred by default.
-    #[arg(long, global = true, env = "EASY_MUSIC_YT_DLP", value_name = "PATH")]
+    /// yt-dlp executable path. A bundled executable next to easymusic is preferred by default.
+    #[arg(long, global = true, env = "EASYMUSIC_YT_DLP", value_name = "PATH")]
     yt_dlp: Option<PathBuf>,
 
     /// yt-dlp JavaScript runtime spec, for example quickjs:/app/qjs or deno:/app/deno.
     #[arg(
         long,
         global = true,
-        env = "EASY_MUSIC_JS_RUNTIME",
+        env = "EASYMUSIC_JS_RUNTIME",
         value_name = "RUNTIME[:PATH]"
     )]
     js_runtime: Option<String>,
@@ -35,7 +35,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "EASY_MUSIC_YT_DLP_COOKIES",
+        env = "EASYMUSIC_YT_DLP_COOKIES",
         value_name = "PATH"
     )]
     cookies: Option<PathBuf>,
@@ -162,7 +162,7 @@ struct StreamArgs {
     #[arg(long, default_value = "-")]
     output: String,
 
-    #[arg(long, env = "EASY_MUSIC_FFMPEG", default_value = "ffmpeg")]
+    #[arg(long, env = "EASYMUSIC_FFMPEG", default_value = "ffmpeg")]
     ffmpeg: PathBuf,
 
     /// Permit localhost, private, and link-local source URLs.
@@ -218,14 +218,14 @@ struct DownloadArgs {
 #[derive(Debug, Args)]
 struct McpArgs {
     /// Loopback address for one-time audio stream URLs.
-    #[arg(long, env = "EASY_MUSIC_STREAM_BIND", default_value = "127.0.0.1:0")]
+    #[arg(long, env = "EASYMUSIC_STREAM_BIND", default_value = "127.0.0.1:0")]
     stream_bind: SocketAddr,
 
     /// Seconds before an unused one-time stream URL expires.
     #[arg(long, default_value_t = 60)]
     stream_ttl_seconds: u64,
 
-    #[arg(long, env = "EASY_MUSIC_FFMPEG", default_value = "ffmpeg")]
+    #[arg(long, env = "EASYMUSIC_FFMPEG", default_value = "ffmpeg")]
     ffmpeg: PathBuf,
 }
 
@@ -235,7 +235,7 @@ struct DoctorArgs {
     #[arg(long)]
     online: bool,
 
-    #[arg(long, env = "EASY_MUSIC_FFMPEG", default_value = "ffmpeg")]
+    #[arg(long, env = "EASYMUSIC_FFMPEG", default_value = "ffmpeg")]
     ffmpeg: PathBuf,
 }
 
@@ -480,7 +480,7 @@ async fn select_from_query(
     client: &MusicClient,
     title: Option<&str>,
     artist: Option<&str>,
-) -> Result<easy_music::SelectResult> {
+) -> Result<easymusic::SelectResult> {
     let keyword = music_query(title, artist)?;
     let search = client.search(&keyword, default_search_limit()).await?;
     select_track(&search.tracks, title, artist)
@@ -708,11 +708,11 @@ mod tests {
     #[test]
     fn cli_accepts_explicit_yt_dlp_and_js_runtime_paths() {
         let cli = Cli::try_parse_from([
-            "easy-music",
+            "easymusic",
             "--yt-dlp",
-            "/opt/easy-music/yt-dlp",
+            "/opt/easymusic/yt-dlp",
             "--js-runtime",
-            "quickjs:/opt/easy-music/qjs",
+            "quickjs:/opt/easymusic/qjs",
             "--cookies",
             "/run/secrets/youtube-cookies.txt",
             "search",
@@ -721,10 +721,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(cli.yt_dlp, Some(PathBuf::from("/opt/easy-music/yt-dlp")));
+        assert_eq!(cli.yt_dlp, Some(PathBuf::from("/opt/easymusic/yt-dlp")));
         assert_eq!(
             cli.js_runtime.as_deref(),
-            Some("quickjs:/opt/easy-music/qjs")
+            Some("quickjs:/opt/easymusic/qjs")
         );
         assert_eq!(
             cli.cookies,

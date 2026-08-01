@@ -15,7 +15,7 @@ pub struct YtDlpConfig {
     /// Path to the standalone `yt-dlp` executable.
     pub executable: PathBuf,
     /// Optional value passed to `yt-dlp --js-runtimes`, such as
-    /// `quickjs:/opt/easy-music/qjs` or `deno:/opt/easy-music/deno`.
+    /// `quickjs:/opt/easymusic/qjs` or `deno:/opt/easymusic/deno`.
     pub js_runtime: Option<String>,
     /// Optional Netscape-format cookies file used for restricted YouTube
     /// requests. This does not require a browser on the server.
@@ -39,7 +39,7 @@ pub struct MusicClient {
 }
 
 impl MusicClient {
-    /// Discover a bundled `yt-dlp` executable next to `easy-music`, falling
+    /// Discover a bundled `yt-dlp` executable next to `easymusic`, falling
     /// back to `PATH` when no bundled executable exists.
     pub fn new() -> Self {
         Self::with_config(YtDlpConfig::default())

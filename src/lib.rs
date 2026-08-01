@@ -1,4 +1,4 @@
-//! Core library for the `easy-music` CLI.
+//! Core library for the `easymusic` CLI.
 //!
 //! The public API is intentionally small: resolve music metadata with
 //! [`MusicClient`], rank candidates with [`select_track`], and stream a

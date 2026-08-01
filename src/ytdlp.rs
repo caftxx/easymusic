@@ -243,7 +243,7 @@ fn start_error(executable: &Path, error: io::Error) -> EasyMusicError {
         EasyMusicError::new(
             ErrorCode::DependencyMissing,
             format!(
-                "yt-dlp executable not found at {}; bundle it next to easy-music or set EASY_MUSIC_YT_DLP",
+                "yt-dlp executable not found at {}; bundle it next to easymusic or set EASYMUSIC_YT_DLP",
                 executable.display()
             ),
         )

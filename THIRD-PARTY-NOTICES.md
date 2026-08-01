@@ -1,6 +1,6 @@
 # Third-party runtime notices
 
-The easy-music release archives redistribute these unmodified upstream
+The easymusic release archives redistribute these unmodified upstream
 executables so music search works without a system Python or browser:
 
 - [yt-dlp 2026.07.04](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.07.04),
