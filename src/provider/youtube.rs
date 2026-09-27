@@ -1,29 +1,36 @@
+//! YouTube music source backed by the external `yt-dlp` process.
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::api::{YtDlpConfig, validate_http_url};
+use crate::config::YtDlpConfig;
 use crate::error::{EasyMusicError, ErrorCode, Result};
-use crate::model::{ResolvedTrack, SearchResult, Track};
+use crate::network::validate_http_url;
+use crate::provider::{MusicSource, SourceDiagnostics};
+use crate::provider::{SourceResolvedTrack, SourceTrack};
+use crate::track_id::NativeTrackId;
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(90);
 const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 
+/// `MusicSource` implementation that shells out to `yt-dlp`.
 #[derive(Debug, Clone)]
-pub(crate) struct YtDlp {
+pub struct YouTubeSource {
     executable: PathBuf,
     js_runtime: Option<String>,
     cookies: Option<PathBuf>,
 }
 
-impl YtDlp {
-    pub(crate) fn new(mut config: YtDlpConfig) -> Self {
+impl YouTubeSource {
+    pub fn new(mut config: YtDlpConfig) -> Self {
         if config.js_runtime.is_none() {
             config.js_runtime = discover_adjacent_js_runtime(&config.executable);
         }
@@ -34,50 +41,12 @@ impl YtDlp {
         }
     }
 
-    pub(crate) fn executable(&self) -> &Path {
+    pub fn executable(&self) -> &Path {
         &self.executable
     }
 
-    pub(crate) fn js_runtime(&self) -> Option<&str> {
+    pub fn js_runtime(&self) -> Option<&str> {
         self.js_runtime.as_deref()
-    }
-
-    pub(crate) async fn search(&self, keyword: &str, limit: usize) -> Result<SearchResult> {
-        let search = format!("ytsearch{limit}:{keyword}");
-        let output = self
-            .run(
-                &[
-                    "--flat-playlist",
-                    "--skip-download",
-                    "--dump-single-json",
-                    &search,
-                ],
-                SEARCH_TIMEOUT,
-                ErrorCode::UpstreamApi,
-                "search",
-            )
-            .await?;
-        parse_search_output(keyword, &output)
-    }
-
-    pub(crate) async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
-        let page_url = format!("{YOUTUBE_WATCH_URL}{id}");
-        let output = self
-            .run(
-                &[
-                    "--skip-download",
-                    "--no-playlist",
-                    "--format",
-                    "bestaudio/best",
-                    "--dump-single-json",
-                    &page_url,
-                ],
-                RESOLVE_TIMEOUT,
-                ErrorCode::AudioSource,
-                "audio URL resolution",
-            )
-            .await?;
-        parse_resolve_output(id, &output)
     }
 
     async fn run(
@@ -141,6 +110,78 @@ impl YtDlp {
     }
 }
 
+#[async_trait]
+impl MusicSource for YouTubeSource {
+    fn name(&self) -> &'static str {
+        "youtube"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "YouTube (yt-dlp)"
+    }
+
+    fn diagnostics(&self) -> SourceDiagnostics<'_> {
+        SourceDiagnostics {
+            executable: Some(&self.executable),
+            js_runtime: self.js_runtime.as_deref(),
+        }
+    }
+
+    fn prefers_bare_ids(&self) -> bool {
+        true
+    }
+
+    async fn search(&self, keyword: &str, limit: usize) -> Result<Vec<SourceTrack>> {
+        let search = format!("ytsearch{limit}:{keyword}");
+        let output = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "--skip-download",
+                    "--dump-single-json",
+                    &search,
+                ],
+                SEARCH_TIMEOUT,
+                ErrorCode::UpstreamApi,
+                "search",
+            )
+            .await?;
+        parse_search_output(&output)
+    }
+
+    async fn resolve(&self, native: &NativeTrackId) -> Result<SourceResolvedTrack> {
+        let id = native.as_str();
+        let id = id.trim();
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(EasyMusicError::invalid(
+                "YouTube track id is not a valid video ID",
+            ));
+        }
+        let page_url = format!("{YOUTUBE_WATCH_URL}{id}");
+        let output = self
+            .run(
+                &[
+                    "--skip-download",
+                    "--no-playlist",
+                    "--format",
+                    "bestaudio/best",
+                    "--dump-single-json",
+                    &page_url,
+                ],
+                RESOLVE_TIMEOUT,
+                ErrorCode::AudioSource,
+                "audio URL resolution",
+            )
+            .await?;
+        parse_resolve_output(id, &output)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchPage {
     #[serde(default)]
@@ -167,7 +208,7 @@ struct ResolvedEntry {
     ext: Option<String>,
 }
 
-fn parse_search_output(keyword: &str, output: &[u8]) -> Result<SearchResult> {
+fn parse_search_output(output: &[u8]) -> Result<Vec<SourceTrack>> {
     let page: SearchPage = serde_json::from_slice(output).map_err(|error| {
         EasyMusicError::upstream(format!("yt-dlp returned invalid search JSON: {error}"))
     })?;
@@ -185,23 +226,18 @@ fn parse_search_output(keyword: &str, output: &[u8]) -> Result<SearchResult> {
                 .or_else(|| entry.channel.and_then(non_empty))
                 .or_else(|| entry.uploader.and_then(non_empty))
                 .unwrap_or_default();
-            Some(Track {
-                id,
+            Some(SourceTrack {
+                id: NativeTrackId::new(id),
                 title,
                 artist,
                 artwork_url: entry.thumbnail.and_then(non_empty),
             })
         })
         .collect::<Vec<_>>();
-    Ok(SearchResult {
-        ok: true,
-        keyword: keyword.to_owned(),
-        count: tracks.len(),
-        tracks,
-    })
+    Ok(tracks)
 }
 
-fn parse_resolve_output(requested_id: &str, output: &[u8]) -> Result<ResolvedTrack> {
+fn parse_resolve_output(requested_id: &str, output: &[u8]) -> Result<SourceResolvedTrack> {
     let entry: ResolvedEntry = serde_json::from_slice(output).map_err(|error| {
         EasyMusicError::source(format!("yt-dlp returned invalid audio JSON: {error}"))
     })?;
@@ -210,11 +246,13 @@ fn parse_resolve_output(requested_id: &str, output: &[u8]) -> Result<ResolvedTra
         .and_then(non_empty)
         .ok_or_else(|| EasyMusicError::source("yt-dlp did not return a playable audio URL"))?;
     validate_http_url(&url)?;
-    Ok(ResolvedTrack {
-        id: entry
-            .id
-            .and_then(non_empty)
-            .unwrap_or_else(|| requested_id.to_owned()),
+    Ok(SourceResolvedTrack {
+        id: NativeTrackId::new(
+            entry
+                .id
+                .and_then(non_empty)
+                .unwrap_or_else(|| requested_id.to_owned()),
+        ),
         title: entry
             .title
             .and_then(non_empty)
@@ -224,7 +262,7 @@ fn parse_resolve_output(requested_id: &str, output: &[u8]) -> Result<ResolvedTra
     })
 }
 
-fn discover_adjacent_js_runtime(executable: &Path) -> Option<String> {
+pub(crate) fn discover_adjacent_js_runtime(executable: &Path) -> Option<String> {
     let parent = executable
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())?;
@@ -259,17 +297,18 @@ fn start_error(executable: &Path, error: io::Error) -> EasyMusicError {
 }
 
 fn concise_stderr(stderr: &[u8]) -> String {
-    let mut text = String::from_utf8_lossy(stderr)
+    let text = String::from_utf8_lossy(stderr);
+    let mut joined = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .take(4)
         .collect::<Vec<_>>()
         .join(" | ");
-    if text.chars().count() > 600 {
-        text = text.chars().take(597).collect::<String>() + "...";
+    if joined.chars().count() > 600 {
+        joined = joined.chars().take(597).collect::<String>() + "...";
     }
-    text
+    joined
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -309,12 +348,11 @@ mod tests {
             ]
         }"#;
 
-        let result = parse_search_output("晴天 周杰伦", output.as_bytes()).unwrap();
-        assert_eq!(result.keyword, "晴天 周杰伦");
-        assert_eq!(result.count, 2);
-        assert_eq!(result.tracks[0].id, "DYptgVvkVLQ");
-        assert_eq!(result.tracks[0].artist, "杰威尔音乐 JVR Music");
-        assert_eq!(result.tracks[1].artist, "周杰伦");
+        let result = parse_search_output(output.as_bytes()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id.as_str(), "DYptgVvkVLQ");
+        assert_eq!(result[0].artist, "杰威尔音乐 JVR Music");
+        assert_eq!(result[1].artist, "周杰伦");
     }
 
     #[test]
@@ -327,7 +365,7 @@ mod tests {
         }"#;
 
         let resolved = parse_resolve_output("DYptgVvkVLQ", output.as_bytes()).unwrap();
-        assert_eq!(resolved.id, "DYptgVvkVLQ");
+        assert_eq!(resolved.id.as_str(), "DYptgVvkVLQ");
         assert!(resolved.url.starts_with("https://"));
         assert_eq!(resolved.extension.as_deref(), Some("webm"));
     }

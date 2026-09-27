@@ -17,6 +17,10 @@ pub struct SearchResult {
     pub ok: bool,
     pub keyword: String,
     pub count: usize,
+    /// Music source that produced this result (`youtube`, `netease`, `kuwo`,
+    /// or an external plugin name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub tracks: Vec<Track>,
 }
 

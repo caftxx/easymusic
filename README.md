@@ -1,22 +1,156 @@
 # easymusic
 
 Agent-friendly music search and downloading CLI, plus an MCP server for search
-and audio streaming. Music discovery and playable URL resolution are
-implemented exclusively through `yt-dlp`.
+and audio streaming. Music discovery and playable URL resolution go through a
+pluggable **music source (音源)** layer: built-in `youtube` (yt-dlp), `netease`
+(网易云音乐), and `kuwo` (酷我音乐) sources, plus external source plugins that
+are ordinary executables in any language.
 
 The metadata and audio paths remain separate:
 
-- `search` calls `ytsearchN:` with a flat playlist and returns stable JSON.
-- `download` searches and ranks by title/artist or accepts an ID/URL, then
-  streams the original audio format directly to disk.
+- `search` queries one pinned source or falls back through sources in
+  priority order, then ranks candidates locally and returns stable JSON.
+- `download` searches and ranks by title/artist or accepts a namespaced ID/URL,
+  then streams the original audio format directly to disk.
 - `mcp` exposes search and one-time streaming preparation tools over stdio.
 
 No browser, browser engine, page DOM parser, or Python installation is needed
 when the standalone release binaries are used.
 
+## Music sources (音源)
+
+Every backend implements the `MusicSource` trait (`search` + `resolve`) and is
+registered per client:
+
+| Source | Search | Playback resolution | Track ID |
+| --- | --- | --- | --- |
+| `youtube` | `yt-dlp ytsearchN:` | `yt-dlp` bestaudio extraction | video ID (bare while first) |
+| `netease` | `music.163.com/api/search/get/web` | 128k outer link (`/song/media/outer/url`) redirect | `netease:<song id>` |
+| `kuwo` | `search.kuwo.cn/r.s` | `antiserver.kuwo.cn/anti.s` convert_url3 (mp3, aac fallback) | `kuwo:<MUSIC_xxx>` |
+| plugin | your executable | your executable | `<name>:<your id>` |
+
+The **first** enabled source owns the bare-ID namespace when it can work with
+unprefixed IDs — by default that is YouTube, so existing `DYptgVvkVLQ`-style
+IDs keep working. Every other result carries a `<source>:` prefix, and a
+resolved track keeps the namespace it was requested with, so any ID returned by
+`search` or `download` stays reusable by `download --id` / `prepare_stream`.
+Reordering sources never strands an ID: with `--sources netease,youtube`,
+YouTube IDs come back as `youtube:<video id>` because bare IDs now belong to
+netease.
+
+```bash
+# Pin one source for search/download
+easymusic --source netease search --keyword "晴天 周杰伦" --pretty
+
+# Without --source, sources are tried in priority order until one succeeds
+# (useful when yt-dlp is unavailable or YouTube is challenged)
+easymusic search --keyword "晴天 周杰伦"
+
+# Merge and re-rank results across every enabled source
+easymusic search --keyword "夜空中最亮的星" --all-sources --limit 10
+
+# Restrict/reorder the enabled sources (first entry handles bare IDs)
+easymusic --sources kuwo,netease search --keyword "晴天"
+easymusic download --id "kuwo:MUSIC_51685512" --output-dir ./music
+```
+
+Equivalent environment variables are `EASYMUSIC_SOURCE` and
+`EASYMUSIC_SOURCES`.
+
+## Writing a source plugin
+
+A plugin is any executable named `easymusic-source-<name>` placed in a plugin
+directory: `plugins/` beside the easymusic executable, `--plugins-dir <PATH>` /
+`EASYMUSIC_PLUGINS_DIR`, or directories listed in `EASYMUSIC_SOURCE_PATH`.
+Built-in names are reserved. The protocol is plain JSON over stdin/stdout, so
+it can be implemented in any language:
+
+```jsonc
+// stdin — request
+{"protocol":"easymusic-source/1","operation":"search","source":"mysource","keyword":"晴天","limit":10}
+{"protocol":"easymusic-source/1","operation":"resolve","source":"mysource","id":"<native id>"}
+
+// stdout — response
+{"ok":true,"tracks":[{"id":"t1","title":"晴天","artist":"周杰伦","artwork_url":"https://..."}]}
+{"ok":true,"url":"https://cdn.example.com/a.mp3","title":"晴天","extension":"mp3"}
+{"ok":false,"error":{"message":"why it failed"}}
+```
+
+Plugin track IDs are namespaced automatically; return your own native IDs and
+pass them back unchanged (a plugin may also emit already-namespaced IDs, which
+are recognised and left as-is). Resolved URLs must be HTTP(S). One request per
+plugin invocation gets a 60-second deadline that covers feeding stdin, running
+the process, and draining its output, so a plugin that ignores its input or
+never exits cannot wedge a search or an MCP tool call; it fails over like any
+other source error. A non-zero exit code or malformed JSON is reported the same
+way.
+
+A plugin's process tree is **request-scoped**: when the request ends — answer,
+error, deadline, or the caller cancelling the tool call — everything the plugin
+started is terminated, on every platform. Do not keep background processes
+alive between requests. easymusic uses a process group on Unix (`setpgid`,
+then `SIGKILL` to the group) and a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows; the latter is why cleanup does
+not depend on the plugin leader still being alive to enumerate its children.
+Windows plugins start suspended and resume only after job assignment succeeds,
+so even immediately spawned helpers belong to the job. If containment setup
+fails, the invocation reports an error instead of running without cleanup.
+Example minimal plugin (Python):
+
+```python
+#!/usr/bin/env python3
+# save as plugins/easymusic-source-demo and `chmod +x`
+import json, sys
+r = json.load(sys.stdin)
+if r["operation"] == "search":
+    json.dump({"ok": True, "tracks": [{"id": "d1", "title": "Demo", "artist": "easymusic"}]}, sys.stdout)
+else:
+    json.dump({"ok": True, "url": "https://example.com/demo.mp3", "extension": "mp3"}, sys.stdout)
+```
+
+Rust embedders can also implement `MusicSource` in-process and register it with
+`SourceRegistry::from_sources` + `MusicClient::with_registry`.
+
+## Library architecture
+
+The CLI and MCP adapters share the same library workflows:
+
+```text
+CLI / MCP
+    -> MusicClient: query validation, search strategy, ranking, selection
+    -> SourceRegistry: source lookup and native/public ID conversion
+    -> MusicSource: upstream search and URL resolution
+
+ClientConfig -> provider::builder -> configured SourceRegistry
+ExternalSource: JSON protocol -> process: byte exchange and process cleanup
+Resolved URL -> download / streaming
+```
+
+`MusicQuery` keeps title and artist separate for ranking. `SearchStrategy`
+chooses the first available source, pins one source, or merges a source list
+(an empty merge list means all enabled sources). CLI flags and MCP parameters
+are translated into these shared inputs.
+
+Provider implementations return `Vec<SourceTrack>` and `SourceResolvedTrack`,
+whose IDs are `NativeTrackId` values. The registry pairs each native ID with its
+source using `TrackId`, then formats it for the existing JSON response. Source
+implementations do not add prefixes. Native IDs containing colons remain opaque.
+The external JSON adapter alone accepts the legacy already-prefixed plugin IDs.
+
+For Rust source implementations migrating to this API, `search` now returns
+`Result<Vec<SourceTrack>>`, and `resolve` accepts `&NativeTrackId` and returns
+`Result<SourceResolvedTrack>`. `name()` borrows `&str`, so dynamically discovered
+names need no leaked allocation. `source_diagnostics(name)` replaces the
+YouTube-specific client getters and reads the active source's runtime details.
+`SourceRegistry::search` routes to one named source; use `MusicClient` for
+fallback, merged search, and selection. CLI/MCP JSON and the subprocess protocol
+remain unchanged.
+
 ## Runtime layout
 
-Official easymusic release archives include `yt-dlp` and a JavaScript runtime:
+Official easymusic release archives include `yt-dlp` and a JavaScript runtime
+(only the YouTube source and YouTube-specific extraction need them; `netease`
+and `kuwo` work without any external binary):
 
 ```text
 easymusic       # easymusic.exe on Windows
@@ -37,7 +171,8 @@ scripts.
 When building or installing easymusic yourself, provide:
 
 - Rust 1.88 or newer to build.
-- A current standalone `yt-dlp` executable.
+- `netease`/`kuwo` sources need no extra dependency.
+- A current standalone `yt-dlp` executable for the `youtube` source.
 - QuickJS-NG 0.12+ or Deno 2.3+ for current YouTube extraction.
 - `ffmpeg` on `PATH` only for MCP audio output and the library streaming API.
   CLI search and download do not invoke ffmpeg.
@@ -85,22 +220,29 @@ easymusic search --keyword "天地龙鳞" --artist "王力宏" --limit 10 --pret
 
 When both title and artist are supplied, easymusic searches for both (for
 example `天地龙鳞 王力宏`) and then uses the separate values for local ranking.
-Search IDs are YouTube video IDs. Download resolves the selected ID immediately
-before transfer because resolved media URLs are short-lived.
+Track IDs are source namespaced (`netease:186016`, `kuwo:MUSIC_51685512`, or a
+bare YouTube video ID). Download resolves the selected ID immediately before
+transfer because resolved media URLs are short-lived.
 
-The library API uses the same backend:
+The library API uses the same source registry:
 
 ```rust,no_run
-use easymusic::{MusicClient, YtDlpConfig};
+use easymusic::{ClientConfig, MusicClient, MusicQuery, SearchStrategy, YtDlpConfig};
 use std::path::PathBuf;
 
 # async fn example() -> easymusic::Result<()> {
-let client = MusicClient::with_config(YtDlpConfig {
-    executable: PathBuf::from("/opt/easymusic/yt-dlp"),
-    js_runtime: Some("quickjs:/opt/easymusic/qjs".to_owned()),
-    cookies: Some(PathBuf::from("/run/secrets/youtube-cookies.txt")),
+let client = MusicClient::with_config(ClientConfig {
+    yt_dlp: YtDlpConfig {
+        executable: PathBuf::from("/opt/easymusic/yt-dlp"),
+        js_runtime: Some("quickjs:/opt/easymusic/qjs".to_owned()),
+        cookies: Some(PathBuf::from("/run/secrets/youtube-cookies.txt")),
+    },
+    // None = every built-in and plugin source, in this priority order.
+    sources: Some(vec!["netease".to_owned(), "kuwo".to_owned(), "youtube".to_owned()]),
+    plugin_dirs: vec![PathBuf::from("/opt/easymusic/plugins")],
 });
-let results = client.search("晴天 周杰伦", 10).await?;
+let query = MusicQuery::new(Some("晴天"), Some("周杰伦"))?;
+let results = client.search_query(&query, &SearchStrategy::Pinned("netease".into()), 10).await?;
 let audio = client.resolve(&results.tracks[0].id).await?;
 # Ok(())
 # }
@@ -111,11 +253,12 @@ let audio = client.resolve(&results.tracks[0].id).await?;
 Download the selected best audio-only format without transcoding:
 
 ```bash
-# Uses yt-dlp metadata to retain the selected format extension, such as .m4a or .webm
+# Uses the selected source's metadata to retain the format extension, such as .m4a or .webm
 easymusic download --title "天地龙鳞" --artist "王力宏" --pretty
 
-# Resolve a search-result video ID, then save to an exact path
+# Resolve a search-result ID (namespace decides the source), then save exactly
 easymusic download --id "DYptgVvkVLQ" --output "./music/song.webm" --pretty
+easymusic download --id "netease:186016" --output "./music/qingtian.mp3"
 
 # A previously resolved URL can still be downloaded directly
 easymusic download --url "https://example.com/song.mp3" --output-dir "./music"
@@ -162,10 +305,11 @@ easymusic mcp
 
 The MCP server exposes:
 
-- `search_music`: combine title/artist, search through yt-dlp, rank candidates,
-  and return the selected track plus alternatives.
-- `prepare_stream`: resolve a confirmed video ID, start ffmpeg, prebuffer the
-  first audio chunk, and return a short-lived one-time loopback URL.
+- `search_music`: combine title/artist, search the music sources (the server's
+  `--source` is the default and the optional `source` argument overrides it),
+  rank candidates, and return the selected track plus alternatives.
+- `prepare_stream`: resolve a confirmed namespaced ID, start ffmpeg, prebuffer
+  the first audio chunk, and return a short-lived one-time loopback URL.
 
 Streaming profiles are `xiaozhi-v1`, `web-opus`, `pcm-s16le-16k`, and
 `pcm-s16le-24k`. Prepared streams are served only on loopback, expire after 60
@@ -182,8 +326,11 @@ easymusic doctor --pretty
 easymusic doctor --online --pretty
 ```
 
-The result reports the exact yt-dlp command, detected adjacent JS runtime,
-ffmpeg version, and optionally the result of a one-item online YouTube search.
+The result reports the enabled `sources` list, the exact yt-dlp command,
+detected adjacent JS runtime, ffmpeg version, and optionally the result of a
+one-item online search per source. Each dependency also carries `required`, so
+a `netease`/`kuwo`/plugin-only setup passes even without yt-dlp installed; the
+executable stays a hard requirement only while the `youtube` source is enabled.
 
 ## Releases
 
@@ -210,6 +357,9 @@ Only HTTP and HTTPS audio sources are accepted. Direct-URL downloads and
 library streaming reject private, loopback, link-local, and documentation
 addresses unless explicitly allowed by their flag or configuration.
 
-yt-dlp search and extraction depend on YouTube behavior and may require regular
-yt-dlp updates. Use media only where you have the right to access, download,
-and play it, and comply with the source site's terms and applicable law.
+`netease` outer links and `kuwo` play links are the same public endpoints used
+by open-source music tools; VIP-only or removed tracks resolve to an error
+instead of a playable URL. yt-dlp search and extraction depend on YouTube
+behavior and may require regular yt-dlp updates. Use media only where you have
+the right to access, download, and play it, and comply with the source site's
+terms and applicable law.

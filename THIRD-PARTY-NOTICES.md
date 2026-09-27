@@ -16,3 +16,15 @@ executables so music search works without a system Python or browser:
 Source code and complete license texts are available from the linked upstream
 release pages. The pinned versions and SHA-256 checksums used for packaging are
 recorded in `.github/workflows/release.yml`.
+
+## Referenced community designs
+
+No upstream source code is redistributed. The built-in HTTP music sources follow
+publicly documented community endpoint usage (search plus outer-link/convert_url
+playback resolution) from projects such as
+[xiaozhi-mcp-music](https://github.com/ABUGG-007/xiaozhi-mcp-music),
+[LX Music](https://github.com/lyswhut/lx-music-mobile) and
+[MusicFree](https://github.com/maotoumao/MusicFree); the Rust implementations in
+`src/provider/netease.rs` and `src/provider/kuwo.rs` are written for this
+project. All music sources remain subject to the underlying sites' terms of
+service.

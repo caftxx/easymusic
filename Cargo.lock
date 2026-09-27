@@ -385,11 +385,13 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "easymusic"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "clap",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "rmcp",
@@ -398,6 +400,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

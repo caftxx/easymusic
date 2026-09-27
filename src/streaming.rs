@@ -6,10 +6,10 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::api::validate_http_url;
 use crate::error::{EasyMusicError, ErrorCode, Result};
 use crate::model::{AudioChunk, AudioChunkKind, AudioFormat, StreamConfig, StreamStats};
 use crate::network::reject_private_host;
+use crate::network::validate_http_url;
 
 const MAX_OGG_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const AUDIO_CHANNEL_CAPACITY: usize = 8;

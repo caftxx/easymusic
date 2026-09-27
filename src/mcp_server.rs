@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{EasyMusicError, ErrorCode};
 use crate::model::{AudioChunk, AudioChunkKind, AudioFormat, Framing, StreamConfig};
-use crate::{AudioStream, MusicClient, default_search_limit, select_track, spawn_audio_stream};
+use crate::{AudioStream, MusicClient, MusicQuery, SearchStrategy, spawn_audio_stream};
 
 const STREAM_CONTENT_TYPE: &str = "application/x-opus-packets";
 const STREAM_PATH_PREFIX: &str = "/streams/";
@@ -36,6 +36,9 @@ pub struct McpServerConfig {
     pub stream_bind: SocketAddr,
     pub stream_ttl: Duration,
     pub ffmpeg: PathBuf,
+    /// Default music source for `search_music` calls that do not name one,
+    /// e.g. the CLI's global `--source` / `EASYMUSIC_SOURCE`.
+    pub default_source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -136,7 +139,7 @@ struct StreamLease {
 struct SearchMusicParams {
     #[schemars(
         with = "String",
-        description = "Song title. It is combined with artist for the yt-dlp search query."
+        description = "Song title. It is combined with artist for the music source search query."
     )]
     title: Option<String>,
     #[schemars(
@@ -144,11 +147,18 @@ struct SearchMusicParams {
         description = "Optional artist name used for both search and ranking."
     )]
     artist: Option<String>,
+    #[schemars(
+        with = "String",
+        description = "Optional music source to pin the search to, for example youtube, netease, or kuwo. Overrides the server default; without it the default source or the configured priority order is used."
+    )]
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PrepareStreamParams {
-    #[schemars(description = "Track ID returned by the search tool.")]
+    #[schemars(
+        description = "Track ID returned by the search tool, including its \"<source>:\" namespace."
+    )]
     id: String,
     #[schemars(
         schema_with = "mcp_output_profile_schema",
@@ -275,6 +285,7 @@ struct EasyMusicMcp {
     client: MusicClient,
     broker: StreamBroker,
     ffmpeg: PathBuf,
+    default_source: Option<String>,
 }
 
 #[tool_router(server_handler)]
@@ -299,18 +310,11 @@ impl EasyMusicMcp {
         &self,
         params: SearchMusicParams,
     ) -> crate::Result<crate::SelectResult> {
-        let title = trimmed(params.title);
-        let artist = trimmed(params.artist);
-        let keyword = [title.as_deref(), artist.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if keyword.is_empty() {
-            return Err(EasyMusicError::invalid("title or artist is required"));
-        }
-        let search = self.client.search(&keyword, default_search_limit()).await?;
-        select_track(&search.tracks, title.as_deref(), artist.as_deref())
+        let query = MusicQuery::new(params.title.as_deref(), params.artist.as_deref())?;
+        let source = effective_source(params.source, self.default_source.as_deref());
+        self.client
+            .select_query(&query, &SearchStrategy::from_source(source.as_deref()))
+            .await
     }
 
     async fn prepare_stream_inner(
@@ -410,6 +414,10 @@ pub async fn serve_mcp(client: MusicClient, config: McpServerConfig) -> crate::R
         client,
         broker,
         ffmpeg: config.ffmpeg,
+        default_source: config
+            .default_source
+            .map(|source| source.trim().to_owned())
+            .filter(|source| !source.is_empty()),
     }
     .serve(rmcp::transport::stdio())
     .await
@@ -500,6 +508,11 @@ fn trimmed(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// A per-call `source` argument wins over the server's configured default.
+fn effective_source(request: Option<String>, configured: Option<&str>) -> Option<String> {
+    trimmed(request).or_else(|| trimmed(configured.map(str::to_owned)))
 }
 
 fn tool_json<T: Serialize>(result: crate::Result<T>) -> String {
@@ -632,6 +645,7 @@ mod tests {
         let search = serde_json::to_value(schemars::schema_for!(SearchMusicParams)).unwrap();
         assert_eq!(search["properties"]["title"]["type"], "string");
         assert_eq!(search["properties"]["artist"]["type"], "string");
+        assert_eq!(search["properties"]["source"]["type"], "string");
 
         let prepare = serde_json::to_value(schemars::schema_for!(PrepareStreamParams)).unwrap();
         let profile = &prepare["properties"]["profile"];
@@ -645,6 +659,26 @@ mod tests {
         assert!(prepare.get("$defs").is_none());
         assert!(profile.get("anyOf").is_none());
         assert!(profile.get("$ref").is_none());
+    }
+
+    #[test]
+    fn tool_level_source_overrides_the_server_default() {
+        // No tool argument: the startup `--source` decides.
+        assert_eq!(
+            effective_source(None, Some("kuwo")).as_deref(),
+            Some("kuwo")
+        );
+        assert_eq!(
+            effective_source(Some("  ".to_owned()), Some("kuwo")).as_deref(),
+            Some("kuwo")
+        );
+        // An explicit tool argument wins.
+        assert_eq!(
+            effective_source(Some("netease".to_owned()), Some("kuwo")).as_deref(),
+            Some("netease")
+        );
+        // Nothing configured anywhere: fall through to registry priority.
+        assert_eq!(effective_source(None, None), None);
     }
 
     #[test]

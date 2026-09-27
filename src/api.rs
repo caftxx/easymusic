@@ -1,90 +1,102 @@
-use std::path::{Path, PathBuf};
-
+pub use crate::config::{ClientConfig, YtDlpConfig, default_plugin_dirs};
 use crate::error::{EasyMusicError, Result};
 use crate::model::{ResolvedTrack, SearchResult};
-use crate::ytdlp::YtDlp;
+use crate::provider::{SourceDiagnostics, SourceRegistry};
 
 pub use crate::network::validate_http_url;
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
 
-/// Configuration for the external `yt-dlp` process.
-#[derive(Debug, Clone)]
-pub struct YtDlpConfig {
-    /// Path to the standalone `yt-dlp` executable.
-    pub executable: PathBuf,
-    /// Optional value passed to `yt-dlp --js-runtimes`, such as
-    /// `quickjs:/opt/easymusic/qjs` or `deno:/opt/easymusic/deno`.
-    pub js_runtime: Option<String>,
-    /// Optional Netscape-format cookies file used for restricted YouTube
-    /// requests. This does not require a browser on the server.
-    pub cookies: Option<PathBuf>,
-}
-
-impl Default for YtDlpConfig {
-    fn default() -> Self {
-        Self {
-            executable: default_yt_dlp_executable(),
-            js_runtime: None,
-            cookies: None,
-        }
-    }
-}
-
-/// Music search and audio URL resolution backed exclusively by `yt-dlp`.
+/// Multi-source music search and audio URL resolution.
+///
+/// Backends are pluggable [`crate::provider::MusicSource`] implementations
+/// managed by a [`SourceRegistry`]: the built-in `youtube` (yt-dlp),
+/// `netease`, and `kuwo` sources plus any external `easymusic-source-*`
+/// plugins found on disk.
 #[derive(Clone)]
 pub struct MusicClient {
-    backend: YtDlp,
+    registry: SourceRegistry,
 }
 
 impl MusicClient {
-    /// Discover a bundled `yt-dlp` executable next to `easymusic`, falling
-    /// back to `PATH` when no bundled executable exists.
+    /// Discover `yt-dlp` and load every built-in and plugin source.
     pub fn new() -> Self {
-        Self::with_config(YtDlpConfig::default())
+        Self::with_config(ClientConfig::default())
     }
 
-    pub fn with_config(config: YtDlpConfig) -> Self {
-        Self {
-            backend: YtDlp::new(config),
-        }
+    pub fn with_config(config: ClientConfig) -> Self {
+        Self::try_with_config(config).expect("valid client configuration")
     }
 
-    pub fn yt_dlp_executable(&self) -> &Path {
-        self.backend.executable()
+    pub fn try_with_config(config: ClientConfig) -> Result<Self> {
+        Ok(Self::with_registry(
+            crate::provider::builder::build_registry(&config)?,
+        ))
     }
 
-    pub fn js_runtime(&self) -> Option<&str> {
-        self.backend.js_runtime()
+    pub fn registry(&self) -> &SourceRegistry {
+        &self.registry
     }
 
+    /// Build a client on top of a caller-supplied registry, for example one
+    /// created with [`SourceRegistry::from_sources`] and a custom in-process
+    /// [`crate::provider::MusicSource`] implementation.
+    pub fn with_registry(registry: SourceRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn sources(&self) -> Vec<&str> {
+        self.registry.names()
+    }
+
+    /// Diagnostics come from the same source instance used for requests.
+    pub fn source_diagnostics(&self, name: &str) -> Option<SourceDiagnostics<'_>> {
+        self.registry.diagnostics(name)
+    }
+
+    /// Search the first source that succeeds. Pass `source` (for example
+    /// `"netease"`) to pin the search to one music source.
     pub async fn search(&self, keyword: &str, limit: usize) -> Result<SearchResult> {
+        self.search_from(None, keyword, limit).await
+    }
+
+    pub async fn search_from(
+        &self,
+        source: Option<&str>,
+        keyword: &str,
+        limit: usize,
+    ) -> Result<SearchResult> {
         let keyword = keyword.trim();
         if keyword.is_empty() {
             return Err(EasyMusicError::invalid("keyword must not be empty"));
         }
-        if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
-            return Err(EasyMusicError::invalid(format!(
-                "search limit must be between 1 and {MAX_SEARCH_LIMIT}"
-            )));
+        validate_search_limit(limit)?;
+        if let Some(name) = source {
+            return self.registry.search(name, keyword, limit).await;
         }
-        self.backend.search(keyword, limit).await
+        let mut failures = Vec::new();
+        for name in self.sources() {
+            match self.registry.search(name, keyword, limit).await {
+                Ok(result) => return Ok(result),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        Err(EasyMusicError::upstream(format!(
+            "all music sources failed: {}",
+            failures.join(" | ")
+        )))
     }
 
+    /// Resolve a track ID. IDs may carry a `<source>:` namespace (for
+    /// example `netease:186016`); bare IDs route to the first enabled source.
+    /// The resolved track's `id` keeps that namespace, so it stays reusable.
     pub async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
         let id = id.trim();
         if id.is_empty() {
             return Err(EasyMusicError::invalid("track id must not be empty"));
         }
-        if id.len() > 64
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(EasyMusicError::invalid("track id is not a valid video ID"));
-        }
-        self.backend.resolve(id).await
+        self.registry.resolve(id).await
     }
 }
 
@@ -98,31 +110,42 @@ pub fn default_search_limit() -> usize {
     DEFAULT_SEARCH_LIMIT
 }
 
-fn default_yt_dlp_executable() -> PathBuf {
-    let file_name = if cfg!(windows) {
-        "yt-dlp.exe"
-    } else {
-        "yt-dlp"
-    };
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join(file_name)));
-    bundled
-        .filter(|candidate| candidate.is_file())
-        .unwrap_or_else(|| PathBuf::from(file_name))
+pub fn max_search_limit() -> usize {
+    MAX_SEARCH_LIMIT
+}
+
+/// Reject search limits outside `1..=max_search_limit()`. Shared by the
+/// single-source and merged search paths so both behave identically.
+pub fn validate_search_limit(limit: usize) -> Result<()> {
+    if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+        return Err(EasyMusicError::invalid(format!(
+            "search limit must be between 1 and {MAX_SEARCH_LIMIT}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn test_client() -> MusicClient {
+        MusicClient::with_config(ClientConfig {
+            yt_dlp: YtDlpConfig {
+                executable: PathBuf::from("definitely-not-an-executable"),
+                js_runtime: None,
+                cookies: None,
+            },
+            sources: None,
+            // A directory that cannot exist disables plugin discovery.
+            plugin_dirs: vec![PathBuf::from("definitely-not-a-plugin-dir")],
+        })
+    }
 
     #[tokio::test]
-    async fn rejects_invalid_inputs_before_starting_yt_dlp() {
-        let client = MusicClient::with_config(YtDlpConfig {
-            executable: PathBuf::from("definitely-not-an-executable"),
-            js_runtime: None,
-            cookies: None,
-        });
+    async fn rejects_invalid_inputs_before_starting_backends() {
+        let client = test_client();
 
         assert_eq!(
             client.search("   ", 10).await.unwrap_err().code.exit_code(),
@@ -142,26 +165,61 @@ mod tests {
             2
         );
         assert_eq!(client.resolve("").await.unwrap_err().code.exit_code(), 2);
-        assert_eq!(
-            client
-                .resolve("../video")
-                .await
-                .unwrap_err()
-                .code
-                .exit_code(),
-            2
-        );
+    }
+
+    #[tokio::test]
+    async fn routes_namespaced_ids_and_rejects_unknown_sources() {
+        let client = test_client();
+        assert_eq!(client.sources(), ["youtube", "netease", "kuwo"]);
+
+        // Unknown namespaces fail with a helpful argument error.
+        let error = client.resolve("tidal:123").await.unwrap_err();
+        assert_eq!(error.code.exit_code(), 2);
+        assert!(error.message.contains("unknown music source"));
+
+        // A namespaced ID reaches the right source (which then fails because
+        // netease ids must be numeric, not because routing went wrong).
+        let error = client.resolve("netease:abc").await.unwrap_err();
+        assert_eq!(error.code.exit_code(), 2);
+        assert!(error.message.contains("netease"));
+
+        // Bare IDs route to the default (YouTube) source.
+        let error = client.resolve("../video").await.unwrap_err();
+        assert_eq!(error.code.exit_code(), 2);
+        assert!(error.message.contains("YouTube"));
+    }
+
+    #[tokio::test]
+    async fn pinned_search_validates_source_existence() {
+        let client = test_client();
+        let error = client
+            .search_from(Some("tidal"), "song", 5)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code.exit_code(), 2);
+        assert!(error.message.contains("unknown music source"));
     }
 
     #[test]
     fn explicit_configuration_is_exposed_for_diagnostics() {
-        let client = MusicClient::with_config(YtDlpConfig {
-            executable: PathBuf::from("tools/yt-dlp"),
-            js_runtime: Some("quickjs:tools/qjs".to_owned()),
-            cookies: Some(PathBuf::from("tools/cookies.txt")),
+        let client = MusicClient::with_config(ClientConfig {
+            yt_dlp: YtDlpConfig {
+                executable: PathBuf::from("tools/yt-dlp"),
+                js_runtime: Some("quickjs:tools/qjs".to_owned()),
+                cookies: Some(PathBuf::from("tools/cookies.txt")),
+            },
+            sources: Some(vec!["youtube".to_owned()]),
+            plugin_dirs: vec![PathBuf::from("definitely-not-a-plugin-dir")],
         });
 
-        assert_eq!(client.yt_dlp_executable(), Path::new("tools/yt-dlp"));
-        assert_eq!(client.js_runtime(), Some("quickjs:tools/qjs"));
+        assert_eq!(
+            client.source_diagnostics("youtube").unwrap().executable,
+            Some(Path::new("tools/yt-dlp"))
+        );
+        assert_eq!(
+            client.source_diagnostics("youtube").unwrap().js_runtime,
+            Some("quickjs:tools/qjs")
+        );
+        assert_eq!(client.sources(), ["youtube"]);
     }
 }

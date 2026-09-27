@@ -6,10 +6,10 @@ use reqwest::{Client, Response, Url};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-use crate::api::validate_http_url;
 use crate::error::{EasyMusicError, ErrorCode, Result};
 use crate::model::{DownloadConfig, DownloadedFile};
 use crate::network::reject_private_host;
+use crate::network::validate_http_url;
 
 const MAX_REDIRECTS: usize = 10;
 const TEMP_FILE_ATTEMPTS: usize = 100;
