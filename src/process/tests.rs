@@ -177,6 +177,57 @@ async fn successful_request_terminates_its_process_tree_too() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// A helper may retain either output pipe after the leader has exited. Waiting
+// for EOF before cleaning up the tree turns a completed request into a timeout.
+async fn exited_plugin_releases_inherited_pipes(exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "easymusic-inherited-pipes-{exit_code}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pid_file = dir.join("helper.pid");
+    let script = dir.join("plugin");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nsleep 120 & echo $! > '{}'\ncat >/dev/null\nprintf 'reply'\nprintf 'diagnostic' >&2\nexit {exit_code}\n",
+        pid_file.display()
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = TestRunner::with_timeout(script, Duration::from_secs(3))
+        .exchange(&"x".repeat(1024 * 1024))
+        .await;
+    let helper = wait_for_pid_file(&pid_file)
+        .await
+        .expect("helper PID was recorded");
+    assert!(
+        wait_for_descendant_exit(helper).await,
+        "helper survived leader exit"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    if exit_code == 0 {
+        assert_eq!(result.unwrap(), b"reply");
+    } else {
+        match result.unwrap_err() {
+            ProcessError::Exit { status, detail } => {
+                assert_eq!(status.code(), Some(exit_code));
+                assert_eq!(detail, "diagnostic");
+            }
+            other => panic!("expected the leader's exit status, got {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn successful_exit_releases_inherited_output_pipes() {
+    exited_plugin_releases_inherited_pipes(0).await;
+}
+
+#[tokio::test]
+async fn failed_exit_releases_inherited_output_pipes() {
+    exited_plugin_releases_inherited_pipes(7).await;
+}
+
 /// Write a plugin that starts a pipe-inheriting `sleep` helper, records the
 /// helper's pid, then hangs without ever reading its input.
 #[cfg(unix)]

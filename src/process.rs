@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     time::timeout,
 };
@@ -116,16 +116,23 @@ pub(crate) async fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (mut child, _cleanup) = spawn_plugin(command)?;
+    let (mut child, cleanup) = spawn_plugin(command)?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
 
-    // Feeding stdin and draining the output run as two halves of *one*
-    // future: a plugin that ignores its input (or reads it only after
-    // writing a lot of output) cannot wedge us in `write_all`, because
-    // either half keeps the other progressing. No detached task exists, so
-    // cancelling this future also drops the blocked write together with
-    // the request payload instead of leaking them.
+    // Wait for the leader independently of pipe EOF. Descendants may retain
+    // stdout/stderr handles even after the leader exits (including incidental
+    // handle inheritance on Windows). Clean up the tree as soon as that wait
+    // completes, then drain bytes already buffered in the pipes.
+    // All operations stay in one future so cancellation drops the tree guard
+    // and the blocked write instead of detaching a task.
     let exchange = async move {
+        let wait = async move {
+            let status = child.wait().await;
+            drop(cleanup);
+            status
+        };
         let write = async move {
             stdin.write_all(&payload).await?;
             stdin.flush().await?;
@@ -133,32 +140,35 @@ pub(crate) async fn run(
             drop(stdin);
             Ok::<(), io::Error>(())
         };
-        let read = child.wait_with_output();
-        tokio::join!(write, read)
+        tokio::join!(wait, write, read_output(stdout), read_output(stderr))
     };
 
-    let (write_result, status_output) = match timeout(deadline, exchange).await {
+    let (status, write_result, stdout, stderr) = match timeout(deadline, exchange).await {
         Err(_) => {
-            // The dropped future closed stdin and `kill_on_drop` terminated
-            // the plugin leader; `cleanup` takes whatever the plugin
-            // spawned as this function returns.
+            // Dropping the exchange closes stdin and drops both the child and
+            // its tree guard, even if the leader has not exited yet.
             return Err(ProcessError::TimedOut(deadline));
         }
         Ok(pair) => pair,
     };
-    let output = status_output.map_err(ProcessError::Io)?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr)
+    let status = status.map_err(ProcessError::Io)?;
+    let stdout = stdout.map_err(ProcessError::Io)?;
+    let stderr = stderr.map_err(ProcessError::Io)?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr)
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
             .unwrap_or_default()
             .to_owned();
-        return Err(ProcessError::Exit {
-            status: output.status,
-            detail,
-        });
+        return Err(ProcessError::Exit { status, detail });
     }
     write_result.map_err(ProcessError::Io)?;
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+async fn read_output(mut pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }

@@ -158,9 +158,14 @@ async fn run_tree_case(mode: &str) {
     } else {
         let result = task.await.unwrap();
         match mode {
-            "success" => assert_eq!(result.unwrap(), br#"{"ok":true,"tracks":[]}"#),
-            "failure" => assert!(result.unwrap_err().to_string().contains("exited")),
-            _ => assert!(result.unwrap_err().to_string().contains("timed out")),
+            "success" | "leader-exits" => {
+                assert_eq!(result.unwrap(), br#"{"ok":true,"tracks":[]}"#);
+            }
+            "failure" => match result.unwrap_err() {
+                ProcessError::Exit { status, .. } => assert_eq!(status.code(), Some(7)),
+                error => panic!("expected exit code 7, got {error}"),
+            },
+            _ => assert!(matches!(result.unwrap_err(), ProcessError::TimedOut(_))),
         }
     }
     helper.assert_terminated().await;

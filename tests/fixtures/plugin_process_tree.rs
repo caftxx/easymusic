@@ -34,11 +34,9 @@ fn main() {
     while !std::path::Path::new(&args[3]).exists() {
         std::thread::sleep(Duration::from_millis(10));
     }
-    if args[1] == "leader-exits" {
-        // The helper keeps the pipes open after its parent exits.
-        std::process::exit(0);
-    }
-    if args[1] == "success" {
+    if args[1] == "success" || args[1] == "leader-exits" {
+        // In leader-exits mode the helper still holds stdout/stderr. The
+        // runner must clean it up on leader exit, before waiting for pipe EOF.
         std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
         std::io::stdout()
             .write_all(br#"{"ok":true,"tracks":[]}"#)
