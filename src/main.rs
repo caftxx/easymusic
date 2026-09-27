@@ -170,6 +170,21 @@ struct DoctorResult {
     search: Option<Vec<OnlineSearchStatus>>,
 }
 
+impl DoctorResult {
+    fn exit_code(&self) -> ExitCode {
+        if self.ok {
+            ExitCode::SUCCESS
+        } else if [&self.yt_dlp, &self.ffmpeg]
+            .iter()
+            .any(|dependency| dependency.required && !dependency.ok)
+        {
+            ErrorCode::DependencyMissing.as_exit_code()
+        } else {
+            ErrorCode::UpstreamApi.as_exit_code()
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DependencyStatus {
     ok: bool,
@@ -200,24 +215,38 @@ struct DownloadCommandResult {
     file: DownloadedFile,
 }
 
+struct CommandOutput {
+    value: Option<serde_json::Value>,
+    exit_code: ExitCode,
+}
+
+impl CommandOutput {
+    fn success(value: Option<serde_json::Value>) -> Self {
+        Self {
+            value,
+            exit_code: ExitCode::SUCCESS,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let pretty = cli.pretty;
     match run(cli).await {
         Ok(output) => {
-            if let Some(value) = output
+            if let Some(value) = output.value
                 && let Err(error) = print_json(&value, pretty)
             {
                 return print_error(error);
             }
-            ExitCode::SUCCESS
+            output.exit_code
         }
         Err(error) => print_error(error),
     }
 }
 
-async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
+async fn run(cli: Cli) -> Result<CommandOutput> {
     let client = build_client(&cli)?;
     let configured_yt_dlp = yt_dlp_config(&cli);
     match cli.command {
@@ -229,19 +258,27 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
                 SearchStrategy::from_source(cli.source.as_deref())
             };
             let result = client.search_query(&query, &strategy, args.limit).await?;
-            Ok(Some(serde_json::to_value(result).expect("serializable")))
+            Ok(CommandOutput::success(Some(
+                serde_json::to_value(result).expect("serializable"),
+            )))
         }
         Commands::Download(args) => {
             let result = run_download(&client, cli.source.as_deref(), args).await?;
-            Ok(Some(serde_json::to_value(result).expect("serializable")))
+            Ok(CommandOutput::success(Some(
+                serde_json::to_value(result).expect("serializable"),
+            )))
         }
         Commands::Mcp(args) => {
             serve_mcp(client, mcp_config(args, cli.source.clone())).await?;
-            Ok(None)
+            Ok(CommandOutput::success(None))
         }
         Commands::Doctor(args) => {
             let result = run_doctor(&client, &args, &configured_yt_dlp).await?;
-            Ok(Some(serde_json::to_value(result).expect("serializable")))
+            let exit_code = result.exit_code();
+            Ok(CommandOutput {
+                value: Some(serde_json::to_value(result).expect("serializable")),
+                exit_code,
+            })
         }
     }
 }

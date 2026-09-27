@@ -26,6 +26,9 @@ impl Plugins {
         Self(dir)
     }
     fn command(&self) -> Command {
+        self.command_with_sources("a,b")
+    }
+    fn command_with_sources(&self, sources: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_easymusic"));
         // Keep the test independent of user source/runtime preferences.
         for var in [
@@ -39,7 +42,7 @@ impl Plugins {
         }
         cmd.arg("--plugins-dir")
             .arg(&self.0)
-            .args(["--sources", "a,b"]);
+            .args(["--sources", sources]);
         cmd.kill_on_drop(true);
         cmd
     }
@@ -47,6 +50,111 @@ impl Plugins {
 impl Drop for Plugins {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn doctor_exit_code_matches_report_and_preserves_stdout() {
+    let plugins = Plugins::new("doctor");
+    let working_tool = plugins.0.join("working-tool");
+    std::fs::write(&working_tool, "#!/bin/sh\nprintf 'test version 1.0\\n'\n").unwrap();
+    std::fs::set_permissions(&working_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let missing_tool = plugins.0.join("missing-tool");
+    let failed_tool = plugins.0.join("failed-tool");
+    std::fs::write(&failed_tool, "#!/bin/sh\necho broken >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&failed_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Plugin b returns no results; plugin a remains available for partial success.
+    std::fs::write(
+        plugins.0.join("easymusic-source-b"),
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"ok\":true,\"tracks\":[]}'\n",
+    )
+    .unwrap();
+
+    for (label, sources, yt_dlp, ffmpeg, online, expected) in [
+        ("healthy", "youtube", &working_tool, &working_tool, false, 0),
+        (
+            "required yt-dlp missing",
+            "youtube",
+            &missing_tool,
+            &working_tool,
+            false,
+            8,
+        ),
+        (
+            "optional yt-dlp missing",
+            "a,b",
+            &missing_tool,
+            &working_tool,
+            false,
+            0,
+        ),
+        (
+            "ffmpeg missing",
+            "a,b",
+            &working_tool,
+            &missing_tool,
+            false,
+            8,
+        ),
+        (
+            "dependency exits unsuccessfully",
+            "youtube",
+            &failed_tool,
+            &working_tool,
+            false,
+            8,
+        ),
+        (
+            "all online sources fail",
+            "b",
+            &missing_tool,
+            &working_tool,
+            true,
+            5,
+        ),
+        (
+            "one online source works",
+            "a,b",
+            &missing_tool,
+            &working_tool,
+            true,
+            0,
+        ),
+        (
+            "dependency failure takes precedence",
+            "b",
+            &missing_tool,
+            &missing_tool,
+            true,
+            8,
+        ),
+    ] {
+        let mut command = plugins.command_with_sources(sources);
+        command
+            .arg("--yt-dlp")
+            .arg(yt_dlp)
+            .args(["doctor", "--pretty", "--ffmpeg"])
+            .arg(ffmpeg);
+        if online {
+            command.arg("--online");
+        }
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{label}");
+        assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ok"], expected == 0, "{label}");
+        assert_eq!(report["yt_dlp"]["ok"], yt_dlp == &working_tool, "{label}");
+        assert_eq!(
+            report["yt_dlp"]["required"],
+            sources == "youtube",
+            "{label}"
+        );
+        assert_eq!(report["ffmpeg"]["ok"], ffmpeg == &working_tool, "{label}");
+        assert_eq!(report["search"].is_array(), online, "{label}");
     }
 }
 

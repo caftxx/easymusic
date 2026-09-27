@@ -376,6 +376,12 @@ one-item online search per source. Each dependency also carries `required`, so
 a `netease`/`kuwo`/plugin-only setup passes even without yt-dlp installed; the
 executable stays a hard requirement only while the `youtube` source is enabled.
 
+`doctor` writes the full JSON report to stdout even when a check fails. Its exit
+code is `0` when `ok` is true, `8` when a required dependency check fails, or `5`
+when `--online` finds no working source. Dependency failures take precedence
+over online search failures. A missing optional dependency does not fail the
+command, and one working source is enough for the online check to pass.
+
 ## Releases
 
 Tags matching `v*` publish self-contained search/runtime archives for:
