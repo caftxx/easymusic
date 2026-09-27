@@ -29,19 +29,15 @@ registered per client:
 
 | Source | Search | Playback resolution | Track ID |
 | --- | --- | --- | --- |
-| `youtube` | `yt-dlp ytsearchN:` | `yt-dlp` bestaudio extraction | video ID (bare while first) |
+| `youtube` | `yt-dlp ytsearchN:` | `yt-dlp` bestaudio extraction | `youtube:<video id>` |
 | `netease` | `music.163.com/api/search/get/web` | 128k outer link (`/song/media/outer/url`) redirect | `netease:<song id>` |
 | `kuwo` | `search.kuwo.cn/r.s` | `antiserver.kuwo.cn/anti.s` convert_url3 (mp3, aac fallback) | `kuwo:<MUSIC_xxx>` |
 | plugin | your executable | your executable | `<name>:<your id>` |
 
-The **first** enabled source owns the bare-ID namespace when it can work with
-unprefixed IDs — by default that is YouTube, so existing `DYptgVvkVLQ`-style
-IDs keep working. Every other result carries a `<source>:` prefix, and a
-resolved track keeps the namespace it was requested with, so any ID returned by
-`search` or `download` stays reusable by `download --id` / `prepare_stream`.
-Reordering sources never strands an ID: with `--sources netease,youtube`,
-YouTube IDs come back as `youtube:<video id>` because bare IDs now belong to
-netease.
+All public track IDs use `<source>:<native id>`, including YouTube
+(`youtube:DYptgVvkVLQ`). IDs returned by `search` or `download` can be passed
+unchanged to `download --id` / `prepare_stream`, regardless of source order.
+Unprefixed input IDs are rejected. Source order controls search priority only.
 
 ```bash
 # Pin one source for search/download
@@ -54,7 +50,7 @@ easymusic search --keyword "晴天 周杰伦"
 # Merge and re-rank results across every enabled source
 easymusic search --keyword "夜空中最亮的星" --all-sources --limit 10
 
-# Restrict/reorder the enabled sources (first entry handles bare IDs)
+# Restrict/reorder the enabled sources (search priority order)
 easymusic --sources kuwo,netease search --keyword "晴天"
 easymusic download --id "kuwo:MUSIC_51685512" --output-dir ./music
 ```
@@ -225,8 +221,8 @@ easymusic search --keyword "天地龙鳞" --artist "王力宏" --limit 10 --pret
 
 When both title and artist are supplied, easymusic searches for both (for
 example `天地龙鳞 王力宏`) and then uses the separate values for local ranking.
-Track IDs are source namespaced (`netease:186016`, `kuwo:MUSIC_51685512`, or a
-bare YouTube video ID). Download resolves the selected ID immediately before
+Track IDs are source namespaced (`netease:186016`, `kuwo:MUSIC_51685512`, or
+`youtube:DYptgVvkVLQ`). Download resolves the selected ID immediately before
 transfer because resolved media URLs are short-lived.
 
 The library API uses the same source registry:
@@ -262,7 +258,7 @@ Download the selected best audio-only format without transcoding:
 easymusic download --title "天地龙鳞" --artist "王力宏" --pretty
 
 # Resolve a search-result ID (namespace decides the source), then save exactly
-easymusic download --id "DYptgVvkVLQ" --output "./music/song.webm" --pretty
+easymusic download --id "youtube:DYptgVvkVLQ" --output "./music/song.webm" --pretty
 easymusic download --id "netease:186016" --output "./music/qingtian.mp3"
 
 # A previously resolved URL can still be downloaded directly

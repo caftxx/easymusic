@@ -103,7 +103,7 @@ struct SearchArgs {
 
 #[derive(Debug, Args)]
 struct DownloadArgs {
-    /// Resolve this track ID before downloading.
+    /// Resolve this <source>:<native id> track ID before downloading.
     #[arg(long)]
     id: Option<String>,
 

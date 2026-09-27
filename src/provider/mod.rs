@@ -40,8 +40,7 @@ pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// [`MusicSource::search`] returns the source's own native IDs. The
 /// [`SourceRegistry`] namespaces them as `"<name>:<native id>"` so any source
-/// can resolve them unambiguously, except for the single source that owns the
-/// bare-ID namespace (see [`MusicSource::prefers_bare_ids`]).
+/// can resolve them unambiguously.
 #[async_trait]
 pub trait MusicSource: Send + Sync {
     /// Stable short identifier used in CLI flags and ID namespaces.
@@ -50,14 +49,6 @@ pub trait MusicSource: Send + Sync {
     /// Human-readable display name.
     fn display_name(&self) -> &str {
         self.name()
-    }
-
-    /// Whether this source can work with unprefixed IDs. Only the **first**
-    /// registered source can keep that privilege by returning `true`, so a
-    /// re-ordered registry never leaves a source handing out IDs it cannot
-    /// resolve back.
-    fn prefers_bare_ids(&self) -> bool {
-        false
     }
 
     fn diagnostics(&self) -> SourceDiagnostics<'_> {

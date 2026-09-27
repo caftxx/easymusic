@@ -76,13 +76,10 @@ and does **not** pause the download.
 
 ## Preserve source identity
 
-- Pass returned track IDs unchanged, including prefixes such as `netease:` or
-  `kuwo:`. Do not substitute a title, webpage URL, or guessed native ID.
-- Bare input IDs resolve through the first enabled source (normally YouTube).
-  Only that first source can emit bare IDs, if it supports doing so. Keep the
-  enabled source order consistent between search and use.
-  For storage across configurations, retain the originating source as well;
-  do not reinterpret a bare ID after reordering sources.
+- Pass returned track IDs unchanged, including prefixes such as `youtube:`,
+  `netease:`, or `kuwo:`. Do not substitute a title, webpage URL, or guessed native ID.
+- All public IDs require `<source>:<native id>` format; unprefixed IDs are
+  rejected. Source order does not change an ID's format or routing.
 - `--source` pins search; `--sources` sets the enabled sources and their order.
   Without a pin, search falls back in priority order. Resolution routes by
   track ID, so changing `--source` does not move a selected ID to another source.

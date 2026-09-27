@@ -88,8 +88,8 @@ impl MusicClient {
         )))
     }
 
-    /// Resolve a track ID. IDs may carry a `<source>:` namespace (for
-    /// example `netease:186016`); bare IDs route to the first enabled source.
+    /// Resolve a track ID with a required `<source>:` namespace (for
+    /// example `youtube:DYptgVvkVLQ` or `netease:186016`).
     /// The resolved track's `id` keeps that namespace, so it stays reusable.
     pub async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
         let id = id.trim();
@@ -183,8 +183,12 @@ mod tests {
         assert_eq!(error.code.exit_code(), 2);
         assert!(error.message.contains("netease"));
 
-        // Bare IDs route to the default (YouTube) source.
-        let error = client.resolve("../video").await.unwrap_err();
+        // YouTube IDs require the same namespace as every other source.
+        let error = client.resolve("DYptgVvkVLQ").await.unwrap_err();
+        assert_eq!(error.code.exit_code(), 2);
+        assert!(error.message.contains("<source>:<native id>"));
+
+        let error = client.resolve("youtube:../video").await.unwrap_err();
         assert_eq!(error.code.exit_code(), 2);
         assert!(error.message.contains("YouTube"));
     }

@@ -6,10 +6,9 @@ use crate::error::{EasyMusicError, Result};
 use crate::model::{ResolvedTrack, SearchResult, Track};
 use crate::provider::SourceTrack;
 use crate::provider::{MusicSource, SourceDiagnostics};
-use crate::track_id::{NativeTrackId, TrackId};
+use crate::track_id::TrackId;
 
-/// Ordered collection of enabled music sources. The first entry handles
-/// bare (unprefixed) track IDs for backwards compatibility.
+/// Ordered collection of enabled music sources, with IDs routed by source namespace.
 #[derive(Clone)]
 pub struct SourceRegistry {
     sources: Arc<Vec<Arc<dyn MusicSource>>>,
@@ -26,8 +25,7 @@ impl std::fmt::Debug for SourceRegistry {
 
 impl SourceRegistry {
     /// Build a registry from an explicit source list. Library users can
-    /// implement [`MusicSource`] in-process and register it here. The first
-    /// entry handles bare (unprefixed) track IDs.
+    /// implement [`MusicSource`] in-process and register it here.
     pub fn from_sources(sources: Vec<Arc<dyn MusicSource>>) -> Result<Self> {
         if sources.is_empty() {
             return Err(EasyMusicError::invalid(
@@ -76,33 +74,11 @@ impl SourceRegistry {
         )))
     }
 
-    /// The source that handles bare track IDs.
-    pub fn default_source(&self) -> Arc<dyn MusicSource> {
-        self.sources
-            .first()
-            .expect("registry is never empty")
-            .clone()
-    }
-
-    /// The only source allowed to publish unprefixed IDs: the first entry,
-    /// when it opts into bare IDs. Reordering sources therefore never leaves
-    /// a source handing out IDs that route to someone else.
-    fn bare_id_owner(&self) -> Option<&str> {
-        let first = self.sources.first()?;
-        first.prefers_bare_ids().then(|| first.name())
-    }
-
-    fn public_id(&self, source: &str, native: NativeTrackId, explicit: bool) -> String {
-        TrackId::new(source, native)
-            .with_qualification(explicit || self.bare_id_owner() != Some(source))
-            .to_string()
-    }
-
     fn public_search(&self, source: &str, keyword: &str, tracks: Vec<SourceTrack>) -> SearchResult {
         let tracks = tracks
             .into_iter()
             .map(|track| Track {
-                id: self.public_id(source, track.id, false),
+                id: TrackId::new(source, track.id).to_string(),
                 title: track.title,
                 artist: track.artist,
                 artwork_url: track.artwork_url,
@@ -129,18 +105,18 @@ impl SourceRegistry {
         Ok(self.public_search(name, keyword, tracks))
     }
 
-    /// Resolve a possibly namespaced `<source>:<native id>` track ID.
+    /// Resolve a namespaced `<source>:<native id>` track ID.
     ///
     /// The returned ID carries the same namespace callers passed in (or that
     /// [`Self::search`] added), so a resolved ID stays reusable when the
     /// backend reports its own native ID back.
     pub async fn resolve(&self, id: &str) -> Result<ResolvedTrack> {
-        let id = TrackId::parse(id, self.sources[0].name())?;
+        let id = TrackId::parse(id)?;
         self.require_source(id.source())?;
         let source = self.lookup(id.source()).expect("source was validated");
         let resolved = source.resolve(id.native()).await?;
         Ok(ResolvedTrack {
-            id: self.public_id(source.name(), resolved.id, id.is_qualified()),
+            id: TrackId::new(source.name(), resolved.id).to_string(),
             title: resolved.title,
             url: resolved.url,
             extension: resolved.extension,
@@ -156,25 +132,20 @@ mod tests {
     use crate::config::YtDlpConfig;
     use crate::error::ErrorCode;
     use crate::provider::{MusicSource, SourceResolvedTrack, SourceTrack};
+    use crate::track_id::NativeTrackId;
     use async_trait::async_trait;
 
     struct StubSource {
         name: &'static str,
         fail_search: bool,
-        bare_ids: bool,
         searches: AtomicUsize,
     }
 
     impl StubSource {
         fn new(name: &'static str, fail_search: bool) -> Arc<Self> {
-            Self::with_bare_ids(name, fail_search, false)
-        }
-
-        fn with_bare_ids(name: &'static str, fail_search: bool, bare_ids: bool) -> Arc<Self> {
             Arc::new(Self {
                 name,
                 fail_search,
-                bare_ids,
                 searches: AtomicUsize::new(0),
             })
         }
@@ -184,10 +155,6 @@ mod tests {
     impl MusicSource for StubSource {
         fn name(&self) -> &'static str {
             self.name
-        }
-
-        fn prefers_bare_ids(&self) -> bool {
-            self.bare_ids
         }
 
         async fn search(&self, _keyword: &str, limit: usize) -> Result<Vec<SourceTrack>> {
@@ -268,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_uses_the_id_namespace_and_bare_ids_use_the_default() {
+    async fn resolve_uses_the_id_namespace_and_rejects_bare_ids() {
         let registry = registry_with(vec![
             StubSource::new("first", false),
             StubSource::new("second", false),
@@ -276,8 +243,9 @@ mod tests {
 
         let namespaced = registry.resolve("second:42").await.unwrap();
         assert_eq!(namespaced.url, "https://cdn.example.com/second/42.mp3");
-        let bare = registry.resolve("42").await.unwrap();
-        assert_eq!(bare.url, "https://cdn.example.com/first/42.mp3");
+        let error = registry.resolve("42").await.unwrap_err();
+        assert!(matches!(error.code, ErrorCode::InvalidArguments));
+        assert!(error.message.contains("<source>:<native id>"));
     }
 
     #[tokio::test]
@@ -295,88 +263,42 @@ mod tests {
         let again = registry.resolve(&resolved.id).await.unwrap();
         assert_eq!(again.url, "https://cdn.example.com/b/correct.mp3");
 
-        // "a" is first but does not claim the bare namespace, so even an ID
-        // supplied bare comes back disambiguated.
-        let first = registry.resolve("correct").await.unwrap();
+        let first = registry.resolve("a:correct").await.unwrap();
         assert_eq!(first.id, "a:correct");
         assert_eq!(first.url, "https://cdn.example.com/a/correct.mp3");
     }
 
     #[tokio::test]
-    async fn bare_id_owner_resolves_bare_ids_unchanged() {
-        let registry = registry_with(vec![
-            StubSource::with_bare_ids("youtube", false, true),
+    async fn search_ids_are_namespaced_and_reusable_across_source_orders() {
+        let sources = vec![
+            StubSource::new("youtube", false),
             StubSource::new("netease", false),
-        ]);
+            StubSource::new("kuwo", false),
+        ];
+        let registry = registry_with(sources.clone());
+        let reordered = registry_with(sources.into_iter().rev().collect());
 
-        let resolved = registry.resolve("abc123").await.unwrap();
-        assert_eq!(resolved.id, "abc123");
-        assert_eq!(resolved.url, "https://cdn.example.com/youtube/abc123.mp3");
-    }
-
-    #[tokio::test]
-    async fn an_explicit_namespace_is_never_downgraded() {
-        // "youtube" owns the bare namespace, yet a caller that spells it out
-        // must get that same spelling back.
-        let registry = registry_with(vec![
-            StubSource::with_bare_ids("youtube", false, true),
-            StubSource::new("netease", false),
-        ]);
-
-        let resolved = registry.resolve("youtube:abc123").await.unwrap();
-        assert_eq!(resolved.id, "youtube:abc123");
-        assert_eq!(resolved.url, "https://cdn.example.com/youtube/abc123.mp3");
-    }
-
-    #[tokio::test]
-    async fn search_and_resolve_agree_on_the_same_id_shape() {
-        let registry = registry_with(vec![
-            StubSource::new("netease", false),
-            StubSource::with_bare_ids("youtube", false, true),
-        ]);
-
-        // Whatever search hands out must be accepted by resolve unchanged.
-        for name in ["netease", "youtube"] {
-            let searched = registry.search(name, "晴天", 5).await.unwrap();
-            let resolved = registry.resolve(&searched.tracks[0].id).await.unwrap();
-            assert_eq!(resolved.id, searched.tracks[0].id);
-            assert!(resolved.url.contains(&format!("/{name}/")));
+        for name in ["youtube", "netease", "kuwo"] {
+            for search_registry in [&registry, &reordered] {
+                let searched = search_registry.search(name, "晴天", 5).await.unwrap();
+                let id = &searched.tracks[0].id;
+                assert_eq!(id, &format!("{name}:track-1"));
+                for resolve_registry in [&registry, &reordered] {
+                    let resolved = resolve_registry.resolve(id).await.unwrap();
+                    assert_eq!(&resolved.id, id);
+                    assert_eq!(
+                        resolved.url,
+                        format!("https://cdn.example.com/{name}/track-1.mp3")
+                    );
+                }
+            }
         }
-    }
 
-    #[tokio::test]
-    async fn bare_id_owner_keeps_unprefixed_ids() {
-        let registry = registry_with(vec![
-            StubSource::with_bare_ids("youtube", false, true),
-            StubSource::new("netease", false),
-        ]);
-
-        let result = registry.search("youtube", "晴天", 5).await.unwrap();
-        assert_eq!(result.tracks[0].id, "track-1");
-    }
-
-    #[tokio::test]
-    async fn reordered_sources_namespace_a_bare_id_source_again() {
-        // Regression: `--sources netease,youtube --source youtube` used to
-        // return bare video IDs that then resolved against netease.
-        let registry = registry_with(vec![
-            StubSource::new("netease", false),
-            StubSource::with_bare_ids("youtube", false, true),
-        ]);
-
-        let result = registry.search("youtube", "晴天", 5).await.unwrap();
-        assert_eq!(result.tracks[0].id, "youtube:track-1");
-
-        // Feeding that ID back must route to YouTube, not to the default.
-        let resolved = registry.resolve(&result.tracks[0].id).await.unwrap();
-        assert_eq!(resolved.url, "https://cdn.example.com/youtube/track-1.mp3");
-
-        // The fallback path must namespace consistently too.
-        let fallback = crate::MusicClient::with_registry(registry.clone())
+        let fallback = crate::MusicClient::with_registry(registry)
             .search("晴天", 5)
             .await
             .unwrap();
-        assert_eq!(fallback.tracks[0].id, "netease:track-1");
+        assert_eq!(fallback.tracks[0].id, "youtube:track-1");
     }
 
     #[tokio::test]

@@ -127,10 +127,6 @@ impl MusicSource for YouTubeSource {
         }
     }
 
-    fn prefers_bare_ids(&self) -> bool {
-        true
-    }
-
     async fn search(&self, keyword: &str, limit: usize) -> Result<Vec<SourceTrack>> {
         let search = format!("ytsearch{limit}:{keyword}");
         let output = self
