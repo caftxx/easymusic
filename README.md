@@ -17,6 +17,11 @@ The metadata and audio paths remain separate:
 No browser, browser engine, page DOM parser, or Python installation is needed
 when the standalone release binaries are used.
 
+For agents, the [easymusic skill](skills/easymusic/SKILL.md) explains how to
+choose between CLI and MCP, select tracks, download files, and consume one-time
+audio streams. Its `skills/easymusic/` directory can be used with a host that
+supports Agent Skills.
+
 ## Music sources (音源)
 
 Every backend implements the `MusicSource` trait (`search` + `resolve`) and is
@@ -310,6 +315,45 @@ The MCP server exposes:
   rank candidates, and return the selected track plus alternatives.
 - `prepare_stream`: resolve a confirmed namespaced ID, start ffmpeg, prebuffer
   the first audio chunk, and return a short-lived one-time loopback URL.
+
+The agent prepares audio through MCP, then hands it to a compatible player.
+`prepare_stream` does not itself start playback:
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Agent
+    participant MCP as easymusic MCP
+    participant Source as Music source
+    participant Player as Local player
+
+    User->>Agent: Play a song
+    Agent->>MCP: search_music(title, artist)
+    MCP->>Source: Search by title and artist
+    Source-->>MCP: Tracks
+    MCP->>MCP: Rank candidates and select the best match
+    MCP-->>Agent: selected, alternatives, needs_confirmation
+    alt needs_confirmation is true
+        Agent->>User: Ask which track to play
+        User-->>Agent: Confirm a track
+    end
+    Note over Agent,Player: Ensure a compatible local player is available
+    Agent->>MCP: prepare_stream(id, profile="web-opus")
+    Note over Agent,MCP: Optional: start_seconds and duration_seconds
+    MCP->>Source: Resolve the selected track ID
+    Source-->>MCP: Upstream audio URL
+    MCP->>MCP: Start ffmpeg and prebuffer the first audio chunk
+    MCP-->>Agent: stream_url, ready=true, format metadata, expires_in_seconds
+    Agent->>Player: Immediately pass stream_url and format metadata
+    Player->>MCP: GET stream_url (once)
+    MCP-->>Player: Stream audio over loopback HTTP
+    Player->>Player: Decode and play audio
+```
+
+Pass the returned track ID unchanged. The player must be able to reach the MCP
+server's loopback address. Do not probe or prefetch `stream_url` before playback;
+that can consume it. If it expires or has already been consumed, call
+`prepare_stream` again for the same selected track to obtain a fresh URL.
 
 Streaming profiles are `xiaozhi-v1`, `web-opus`, `pcm-s16le-16k`, and
 `pcm-s16le-24k`. Prepared streams are served only on loopback, expire after 60
