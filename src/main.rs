@@ -13,8 +13,11 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::process::Command;
 
+// cargo-style version: "easymusic <semver> (<git hash> <commit date>)"; see build.rs.
+const VERSION: &str = env!("EASYMUSIC_VERSION");
+
 #[derive(Debug, Parser)]
-#[command(name = "easymusic", version, about)]
+#[command(name = "easymusic", version = VERSION, about)]
 struct Cli {
     /// yt-dlp executable path. A bundled executable next to easymusic is preferred by default.
     #[arg(long, global = true, env = "EASYMUSIC_YT_DLP", value_name = "PATH")]
