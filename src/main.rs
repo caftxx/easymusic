@@ -79,7 +79,7 @@ enum Commands {
     Download(DownloadArgs),
     /// Serve Agent tools over MCP stdio with loopback streaming URLs.
     Mcp(McpArgs),
-    /// Check yt-dlp, ffmpeg, and optionally online search.
+    /// Check ffmpeg and optionally online search.
     Doctor(DoctorArgs),
 }
 
@@ -152,7 +152,7 @@ struct McpArgs {
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
-    /// Also issue a small search through every enabled music source.
+    /// Also issue a small search through --source, or every enabled music source.
     #[arg(long)]
     online: bool,
 
@@ -163,7 +163,6 @@ struct DoctorArgs {
 #[derive(Debug, Serialize)]
 struct DoctorResult {
     ok: bool,
-    yt_dlp: DependencyStatus,
     ffmpeg: DependencyStatus,
     js_runtime: Option<String>,
     sources: Vec<String>,
@@ -173,8 +172,7 @@ struct DoctorResult {
 #[derive(Debug, Serialize)]
 struct DependencyStatus {
     ok: bool,
-    /// Whether the current configuration actually needs this tool. yt-dlp is
-    /// only required while the `youtube` source is enabled.
+    /// Whether this tool is a required dependency.
     required: bool,
     command: String,
     version: Option<String>,
@@ -240,7 +238,8 @@ async fn run(cli: Cli) -> Result<Option<serde_json::Value>> {
             Ok(None)
         }
         Commands::Doctor(args) => {
-            let result = run_doctor(&client, &args, &configured_yt_dlp).await?;
+            let result =
+                run_doctor(&client, &args, &configured_yt_dlp, cli.source.as_deref()).await?;
             Ok(Some(serde_json::to_value(result).expect("serializable")))
         }
     }
@@ -313,19 +312,18 @@ async fn run_doctor(
     client: &MusicClient,
     args: &DoctorArgs,
     configured: &YtDlpConfig,
+    source: Option<&str>,
 ) -> Result<DoctorResult> {
     let diagnostics = client.source_diagnostics("youtube");
-    let executable = diagnostics
-        .and_then(|d| d.executable)
-        .unwrap_or(&configured.executable);
-    let mut yt_dlp = check_dependency(executable, &["--version"]).await;
-    // Only the YouTube source shells out to yt-dlp, so a netease/kuwo/plugin
-    // only configuration must not fail on its absence.
-    yt_dlp.required = client.sources().contains(&"youtube");
+    let search_sources = if args.online {
+        source.map_or_else(|| client.sources(), |source| vec![source])
+    } else {
+        Vec::new()
+    };
     let ffmpeg = check_ffmpeg(&args.ffmpeg).await;
     let search = if args.online {
         let mut statuses = Vec::new();
-        for name in client.sources() {
+        for name in search_sources {
             statuses.push(
                 match client.search_from(Some(name), "晴天 周杰伦", 1).await {
                     Ok(result) if !result.tracks.is_empty() => OnlineSearchStatus {
@@ -350,10 +348,9 @@ async fn run_doctor(
     } else {
         None
     };
-    let ok = doctor_is_ok(&yt_dlp, &ffmpeg, search.as_ref());
+    let ok = doctor_is_ok(&ffmpeg, search.as_ref());
     Ok(DoctorResult {
         ok,
-        yt_dlp,
         ffmpeg,
         js_runtime: diagnostics
             .and_then(|d| d.js_runtime)
@@ -364,22 +361,9 @@ async fn run_doctor(
     })
 }
 
-/// A missing dependency only fails the doctor run when the active
-/// configuration actually needs it, and `--online` passes as soon as any one
-/// enabled source answered.
-fn doctor_is_ok(
-    yt_dlp: &DependencyStatus,
-    ffmpeg: &DependencyStatus,
-    search: Option<&Vec<OnlineSearchStatus>>,
-) -> bool {
-    [
-        yt_dlp.required.then_some(yt_dlp.ok),
-        ffmpeg.required.then_some(ffmpeg.ok),
-    ]
-    .into_iter()
-    .flatten()
-    .all(|ok| ok)
-        && search.is_none_or(|statuses| statuses.iter().any(|status| status.ok))
+/// ffmpeg is required, and `--online` passes if any checked source answered.
+fn doctor_is_ok(ffmpeg: &DependencyStatus, search: Option<&Vec<OnlineSearchStatus>>) -> bool {
+    ffmpeg.ok && search.is_none_or(|statuses| statuses.iter().any(|status| status.ok))
 }
 
 async fn run_download(
@@ -734,35 +718,26 @@ mod tests {
     }
 
     #[test]
-    fn doctor_only_requires_yt_dlp_when_the_youtube_source_is_enabled() {
+    fn doctor_requires_ffmpeg_and_any_checked_online_source() {
         let ffmpeg = dependency(true, true);
 
-        // Regression: plugin/netease/kuwo-only setups passed every check but
-        // still reported ok:false because yt-dlp was absent.
+        assert!(doctor_is_ok(&ffmpeg, None));
         assert!(doctor_is_ok(
-            &dependency(false, false),
             &ffmpeg,
             Some(&online_search(&[("netease", true)]))
         ));
-        // While YouTube is enabled its executable stays a hard requirement.
-        assert!(!doctor_is_ok(
-            &dependency(false, true),
+        // A failing YouTube check must not override another working source.
+        assert!(doctor_is_ok(
             &ffmpeg,
             Some(&online_search(&[("youtube", false), ("netease", true)]))
         ));
         // ffmpeg is unconditional, and one answering source is enough.
-        assert!(!doctor_is_ok(
-            &dependency(true, true),
-            &dependency(false, true),
-            None
-        ));
+        assert!(!doctor_is_ok(&dependency(false, true), None));
         assert!(doctor_is_ok(
-            &dependency(true, true),
             &ffmpeg,
             Some(&online_search(&[("a", false), ("b", true)]))
         ));
         assert!(!doctor_is_ok(
-            &dependency(true, true),
             &ffmpeg,
             Some(&online_search(&[("a", false)]))
         ));

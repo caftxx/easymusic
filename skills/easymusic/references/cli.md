@@ -9,6 +9,8 @@ easymusic download --help
 easymusic doctor --pretty
 # Contacts each enabled source with a small search:
 easymusic doctor --online --pretty
+# Check only YouTube:
+easymusic doctor --online --source youtube --pretty
 ```
 
 Successful commands print JSON on stdout. Runtime errors print
@@ -21,9 +23,11 @@ Search and download from `netease`/`kuwo` need no external executable. YouTube
 uses yt-dlp and a JavaScript runtime; release bundles include them. Streaming
 needs ffmpeg; CLI search/download do not. Doctor currently checks ffmpeg as a
 required dependency even for CLI-only use, so inspect individual dependency
-results when its overall `ok` is false. `yt_dlp.required` depends on whether
-YouTube is enabled. Online doctor passes its search check if any source works;
-inspect per-source results for a pinned-source failure.
+results when its overall `ok` is false. yt-dlp is only exercised by the YouTube
+online search; failures appear in that source's `search` result. There is no
+separate top-level `yt_dlp` check or field. `--source` limits online checks to that
+source; otherwise every enabled source is checked. Online doctor passes its
+search check if any checked source works.
 
 ## Search
 

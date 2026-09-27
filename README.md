@@ -364,13 +364,16 @@ MCP loopback listener. The corresponding CLI flags are also available.
 ```bash
 easymusic doctor --pretty
 easymusic doctor --online --pretty
+easymusic doctor --online --source youtube --pretty
 ```
 
-The result reports the enabled `sources` list, the exact yt-dlp command,
-detected adjacent JS runtime, ffmpeg version, and optionally the result of a
-one-item online search per source. Each dependency also carries `required`, so
-a `netease`/`kuwo`/plugin-only setup passes even without yt-dlp installed; the
-executable stays a hard requirement only while the `youtube` source is enabled.
+The result reports the enabled `sources` list, detected adjacent JS runtime,
+ffmpeg version, and optionally the result of a one-item online search per source.
+`--source` limits online checks to that source; otherwise every enabled source is
+checked. ffmpeg is required. yt-dlp is only exercised by the YouTube online search;
+any failure is reported in that source's `search` result, with no separate
+top-level `yt_dlp` check or field. Online checks pass if any checked source works,
+so a failed YouTube check does not fail doctor when another checked source succeeds.
 
 ## Releases
 

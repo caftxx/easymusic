@@ -26,6 +26,9 @@ impl Plugins {
         Self(dir)
     }
     fn command(&self) -> Command {
+        self.command_with_sources("a,b")
+    }
+    fn command_with_sources(&self, sources: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_easymusic"));
         // Keep the test independent of user source/runtime preferences.
         for var in [
@@ -39,7 +42,7 @@ impl Plugins {
         }
         cmd.arg("--plugins-dir")
             .arg(&self.0)
-            .args(["--sources", "a,b"]);
+            .args(["--sources", sources]);
         cmd.kill_on_drop(true);
         cmd
     }
@@ -47,6 +50,97 @@ impl Plugins {
 impl Drop for Plugins {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn doctor_checks_yt_dlp_only_through_online_youtube_search() {
+    let plugins = Plugins::new("doctor");
+    let yt_dlp = plugins.0.join("yt-dlp");
+    let ffmpeg = plugins.0.join("ffmpeg");
+    let marker = plugins.0.join("yt-dlp-called");
+    for (path, script) in [
+        (
+            &yt_dlp,
+            "#!/bin/sh\nprintf '%s\\n' called >> \"$0-called\"\necho unavailable >&2\nexit 1\n",
+        ),
+        (&ffmpeg, "#!/bin/sh\necho 'ffmpeg test'\n"),
+    ] {
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    for (sources, args, checked, ok, search_sources) in [
+        ("youtube,b", vec![], false, true, vec![]),
+        (
+            "youtube,b",
+            vec!["--source", "youtube"],
+            false,
+            true,
+            vec![],
+        ),
+        (
+            "youtube,b",
+            vec!["--online", "--source", "b"],
+            false,
+            true,
+            vec!["b"],
+        ),
+        ("b", vec!["--online"], false, true, vec!["b"]),
+        (
+            "youtube,b",
+            vec!["--online"],
+            true,
+            true,
+            vec!["youtube", "b"],
+        ),
+        (
+            "youtube,b",
+            vec!["--online", "--source", "youtube"],
+            true,
+            false,
+            vec!["youtube"],
+        ),
+    ] {
+        let _ = std::fs::remove_file(&marker);
+        let output = plugins
+            .command_with_sources(sources)
+            .arg("--yt-dlp")
+            .arg(&yt_dlp)
+            .args(["doctor", "--ffmpeg"])
+            .arg(&ffmpeg)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], ok, "{args:?}: {value}");
+        assert_eq!(marker.exists(), checked, "{args:?}: {value}");
+        assert!(value.get("yt_dlp").is_none(), "{value}");
+        if checked {
+            // Only the search invokes yt-dlp; there is no separate version probe.
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "called\n");
+            let youtube = value["search"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|status| status["source"] == "youtube")
+                .unwrap();
+            assert_eq!(youtube["ok"], false);
+            assert!(youtube["error"].as_str().unwrap().contains("unavailable"));
+        }
+        if search_sources.is_empty() {
+            assert!(value["search"].is_null());
+        } else {
+            let actual = value["search"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|status| status["source"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, search_sources);
+        }
     }
 }
 
